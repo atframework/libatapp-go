@@ -1,0 +1,126 @@
+atapp:
+  id: "0x00001234"
+  name: "sample_echo_svr-1"
+  type_id: 1
+  type_name: "sample_echo_svr"
+  metadata:
+    api_version: v1
+    labels:
+      deployment.environment: test
+      deployment.region: cn
+
+  bus:
+    gateways:
+      # Gateway with conditional word (:+) expression
+      - address: "${EXPR_LOADER_COND_SET:+tcp://active-host:8080}"
+        match_namespaces:
+          - "${EXPR_LOADER_COND_SET:+active-ns}"
+          - "${EXPR_LOADER_COND_UNSET:+inactive-ns}"
+        match_labels:
+          "${EXPR_LOADER_COND_SET:+status}": "${EXPR_LOADER_COND_SET:+val-${EXPR_LOADER_COND_SET}}"
+    listen: "atcp://:::21437"
+    proxy: ""
+    backlog: 256
+    access_token_max_number: 5
+    overwrite_listen_path: false
+    first_idle_timeout: 30s
+    ping_interval: 60s
+    retry_interval: 3s
+    fault_tolerant: 3
+    message_size: 256KB
+    receive_buffer_size: 8MB
+    send_buffer_size: 2MB
+    send_buffer_number: 0
+    topology:
+      rule:
+        allow_direct_connection: true
+        require_same_upstream: true
+        require_same_process: false
+        require_same_host: true
+        match_label:
+          region:
+            value:
+              - cn
+              - us
+          env:
+            value:
+              - test
+      data:
+        label:
+          region: cn
+          env: test
+    crypto:
+      key_exchange_type: 1
+      key_refresh_interval: 5s
+      algorithm:
+        - aes-128-gcm
+        - 32
+        - ATAPP_CRYPTO_ALGORITHM_XCHACHA20_POLY1305_IETF
+    compression:
+      algorithm:
+        - zstd
+        - 200
+        - ATAPP_COMPRESSION_ALGORITHM_ZLIB
+      level: ATAPP_COMPRESSION_LEVEL_FAST
+  timer:
+    tick_interval: 32ms
+    stop_timeout: 10s
+    stop_interval: 256ms
+  etcd:
+    enable: false
+    hosts:
+      - http://127.0.0.1:2375
+      - http://127.0.0.1:2376
+      - http://127.0.0.1:2377
+    path: /atapp/services/astf4g/
+    authorization: ""
+    init:
+      # timeout: 5s
+      tick_interval: 1ms # test min bound
+
+  log:
+    level: debug
+    category:
+      - name: db
+        index: 1 # reorder
+        prefix: "[Log %L][%F %T.%f]: "
+        stacktrace:
+          min: disable
+          max: disable
+      - name: default
+        index: 0
+        prefix: "[Log %L][%F %T.%f][%s:%n(%C)]: "
+        stacktrace:
+          min: error
+          max: fatal
+        sink:
+          - type: file
+            level:
+              min: fatal
+              max: warning
+            rotate:
+              number: 10
+              size: 10485760
+            file: "../log/sample_echo_svr.error.%N.log"
+            writing_alias: "../log/sample_echo_svr.error.log"
+            auto_flush: info
+            flush_interval: 1m
+          - type: file
+            level:
+              min: fatal
+              max: debug
+            rotate:
+              number: 10
+              size: 10485760
+            file: "../log/sample_echo_svr.all.%N.log"
+            writing_alias: "../log/sample_echo_svr.all.log"
+            auto_flush: info
+            flush_interval: 1m
+          - type: stderr
+            level:
+              min: fatal
+              max: debug
+          - type: stdout
+            level:
+              min: fatal
+              max: debug

@@ -1,0 +1,17 @@
+version: "3"
+set: [errexit, pipefail]
+
+shopt: [globstar]
+
+tasks:
+  generate-protocol:
+    desc: "Generate libatapp protoc protocol"
+    dir: "{{.TASKFILE_DIR}}/protocol"
+    vars:
+      PROTOC_EXEC_BIN: '{{.PROTOC_EXEC_BIN | default "protoc"}}'
+    cmds:
+      - |
+        echo -e "\033[34;1mGenerate libatapp  protoc protocol... \033[0m"
+        "{{.PROTOC_EXEC_BIN}}" --go_out=. --mutable_out=. --go_opt=paths=source_relative --mutable_opt=paths=source_relative --proto_path=./ ./atframe/*.proto
+        echo -e "\033[34;1mGenerate libatapp protoc protocol... done \033[0m"
+    silent: true
