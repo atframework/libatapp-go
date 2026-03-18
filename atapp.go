@@ -665,9 +665,12 @@ func (app *AppInstance) internalRunOnce(tickTimer *time.Ticker) error {
 	case <-app.appContext.Done():
 		break
 	case sig := <-app.signalChan:
-		if sig == syscall.SIGTERM || sig == syscall.SIGQUIT {
+		if _, ok := atappSignalGetStopSigs()[sig]; ok {
 			app.GetDefaultLogger().LogInfo("Received signal, stopping...", slog.Any("signal", sig))
 			app.Stop()
+		} else if _, ok := atappSignalGetReloadSigs()[sig]; ok {
+			app.GetDefaultLogger().LogInfo("Received signal, reloading...", slog.Any("signal", sig))
+			app.Reload()
 		}
 	case <-tickTimer.C:
 		if err := app.tick(); err != nil {
@@ -1223,7 +1226,7 @@ func (app *AppInstance) setupStartupLog() error {
 			return err
 		}
 
-		f, err := os.OpenFile(app.config.CrashOutputFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+		f, err := os.OpenFile(app.config.CrashOutputFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
 		if err != nil {
 			app.GetDefaultLogger().LogError("Create crash output file failed", "file", app.config.CrashOutputFile, "error", err)
 			return err
