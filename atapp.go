@@ -1124,7 +1124,7 @@ func (app *AppInstance) setupOptions(arguments []string) error {
 
 	if app.flagSet.Lookup("config").Value.String() != "" {
 		app.GetDefaultLogger().LogInfo("Found Config")
-		app.config.ConfigFile = app.flagSet.Lookup("config").Value.String()
+		app.config.ConfigFile = ExpandExpression(app.flagSet.Lookup("config").Value.String())
 	} else {
 		app.GetDefaultLogger().LogInfo("Not Found Config")
 	}
@@ -1141,15 +1141,15 @@ func (app *AppInstance) setupOptions(arguments []string) error {
 	}
 
 	if app.flagSet.Lookup("pid").Value.String() != "" {
-		app.config.PidFile = app.flagSet.Lookup("pid").Value.String()
+		app.config.PidFile = ExpandExpression(app.flagSet.Lookup("pid").Value.String())
 	}
 
 	if app.flagSet.Lookup("startup-log").Value.String() != "" {
-		app.config.StartupLog = strings.Split(app.flagSet.Lookup("startup-log").Value.String(), ",")
+		app.config.StartupLog = strings.Split(ExpandExpression(app.flagSet.Lookup("startup-log").Value.String()), ",")
 	}
 
 	if app.flagSet.Lookup("crash-output-file").Value.String() != "" {
-		app.config.CrashOutputFile = app.flagSet.Lookup("crash-output-file").Value.String()
+		app.config.CrashOutputFile = ExpandExpression(app.flagSet.Lookup("crash-output-file").Value.String())
 	}
 
 	// 检查位置参数以确定命令
