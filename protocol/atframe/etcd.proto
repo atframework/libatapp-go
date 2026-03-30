@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package atframework.etcd;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "service_discovery/protocol;atframe";
+
+// BackoffType defines the retry backoff strategy
+enum BackoffType {
+  BACKOFF_TYPE_UNSPECIFIED = 0;
+  BACKOFF_FIXED = 1;
+  BACKOFF_LINEAR = 2;
+  BACKOFF_EXPONENTIAL = 3;
+}
+
+// EtcdWatchEventType defines the type of watch event
+enum EtcdWatchEventType {
+  ETCD_WATCH_EVENT_TYPE_UNSPECIFIED = 0;
+  ETCD_WATCH_EVENT_PUT = 1;
+  ETCD_WATCH_EVENT_DELETE = 2;
+}
+
+// EtcdSearchMode defines search strategy for consistent hash
+enum EtcdSearchMode {
+  ETCD_SEARCH_MODE_ALL = 0;
+  ETCD_SEARCH_MODE_COMPACT = 1;
+  ETCD_SEARCH_MODE_UNIQUE_NODE = 2;
+  ETCD_SEARCH_MODE_COMPACT_UNIQUE_NODE = 3;
+  ETCD_SEARCH_MODE_NEXT_NODE = 4;
+  ETCD_SEARCH_MODE_NEXT_COMPACT = 5;
+  ETCD_SEARCH_MODE_NEXT_UNIQUE_NODE = 6;
+  ETCD_SEARCH_MODE_NEXT_COMPACT_UNIQUE_NODE = 7;
+}
+
+// RetryConfig defines retry policy for failed operations
+message RetryConfig {
+  int32 max_retries = 1;                        // Maximum number of retries (default 3)
+  google.protobuf.Duration initial_interval = 2; // Initial retry interval (default 1s)
+  google.protobuf.Duration max_interval = 3;     // Maximum retry interval (default 30s)
+  BackoffType backoff = 4;                       // Backoff strategy (default EXPONENTIAL)
+}
+
+// TLSConfig defines TLS/SSL configuration for secure connections
+message TLSConfig {
+  bool enabled = 1;                             // Enable TLS
+  string cert_file = 2;                         // Client certificate file path
+  string key_file = 3;                          // Client private key file path
+  string ca_file = 4;                           // CA certificate file path
+  string server_name = 5;                       // Server name for SNI
+  bool insecure_skip_verify = 6;               // Skip certificate verification (insecure!)
+  uint32 min_version = 7;                       // Minimum TLS version (12=TLS1.2, 13=TLS1.3)
+  uint32 max_version = 8;                       // Maximum TLS version
+  int32 client_auth = 9;                        // Client authentication type (tls.ClientAuthType)
+  
+  // Advanced TLS options
+  string cipher_suites = 10;                    // TLS cipher suites (comma-separated)
+  string cipher_suites_tls13 = 11;             // TLS 1.3 cipher suites (comma-separated)
+  bool enable_alpn = 12;                        // Enable ALPN protocol negotiation
+  string client_cert_type = 13;                 // Certificate type: PEM, DER
+  string key_type = 14;                         // Key type: PEM, DER, ENG
+  string key_password = 15;                     // Password for encrypted key files
+  
+  // mTLS authentication
+  string tls_auth_username = 16;               // TLS auth username for client certificates
+  string tls_auth_password = 17;               // TLS auth password for client certificates
+}
+
+
+// AuthConfig defines authentication configuration
+message AuthConfig {
+  string token = 1;                             // Auth token
+  google.protobuf.Duration token_refresh_interval = 2;  // Token refresh interval
+  string username = 3;                          // Username for authentication
+  string password = 4;                          // Password for authentication
+}
+
+// EtcdClusterConf defines the configuration for connecting to an etcd cluster
+message EtcdClusterConf {
+  repeated string endpoints = 1;                // List of etcd endpoints (host:port)
+  google.protobuf.Duration dial_timeout = 2;   // Connection dial timeout
+  TLSConfig tls = 3;                            // TLS configuration for etcd connection
+  // ProxyConfig and DNSConfig removed; not supported in clientv3
+  AuthConfig auth = 6;                          // Authentication configuration
+  RetryConfig retry = 7;                        // Retry policy configuration
+  bool debug_mode = 8;                          // Enable debug mode (verbose logging)
+  string user_agent = 9;                        // Custom user agent string
+}
+
+// EtcdResponseHeader represents etcd response metadata
+message EtcdResponseHeader {
+  uint64 cluster_id = 1;
+  uint64 member_id = 2;
+  int64 revision = 3;
+  uint64 raft_term = 4;
+}
+
+// EtcdKeyValue represents a key-value pair in etcd
+message EtcdKeyValue {
+  bytes key = 1;
+  bytes value = 2;
+  int64 create_revision = 3;
+  int64 mod_revision = 4;
+  int64 version = 5;
+  int64 lease = 6;
+}
+
+// EtcdWatchEvent represents a watch event
+message EtcdWatchEvent {
+  EtcdWatchEventType type = 1;
+  EtcdKeyValue kv = 2;
+  EtcdKeyValue prev_kv = 3;
+}
+
+// EtcdArea represents service area information (region, district, zone)
+// Mirrors C++ atapp_area for cross-language compatibility
+message EtcdArea {
+  string region = 1;
+  string district = 2;
+  uint32 zone_id = 3;
+}
+
+// EtcdMetadata represents service metadata with labels
+// Mirrors C++ atapp_metadata for cross-language compatibility
+message EtcdMetadata {
+  string api_version = 1;
+  string kind = 2;
+  string group = 3;
+
+  string name = 11;
+  string namespace_name = 12;
+  string uid = 13;
+
+  string service_subset = 23;
+  map<string, string> labels = 24;
+}
+
+// EtcdGateway represents a service gateway entry point
+// Mirrors C++ atapp_gateway for cross-language compatibility
+message EtcdGateway {
+  string address = 1;
+
+  repeated string match_hosts = 11;          // match hostname with "In" operator
+  repeated string match_namespaces = 21;     // match metadata.namespace_name with "In" operator
+  map<string, string> match_labels = 22;     // match all labels in metadata
+}
+
+// EtcdDiscoveryNode represents a discovered service node
+// This is the main data structure stored in etcd for service instances
+// Maps to C++ atapp_discovery from atapp_conf.proto
+// Note: Use the AtappDiscovery type from atapp_conf.proto for actual service registration
+// This message is kept for documentation and etcd-specific structure understanding
+message EtcdDiscoveryNode {
+  uint64 id = 1;                            // Unique numeric ID
+  string name = 2;                          // Unique string name
+  string hostname = 3;                      // Hostname of the service instance
+  int32 pid = 4;                            // Process ID
+  repeated string listen = 5;               // Listen addresses (e.g., ["192.168.1.1:8080"])
+  string hash_code = 6;                     // Hash code for consistent hashing
+  uint64 type_id = 7;                       // Service type ID
+  string type_name = 8;                     // Service type name
+  EtcdArea area = 9;                        // Service area (region, district, zone)
+  string version = 10;                      // Service version
+  string custom_data = 11;                  // Custom data field
+  string identity = 12;                     // Service identity/instance identifier
+  repeated EtcdGateway gateways = 13;       // Service gateways
+  EtcdMetadata metadata = 14;               // Service metadata with labels
+
+  // Etcd versioning information
+  uint64 create_revision = 15;              // etcd create revision (for tracking)
+  uint64 mod_revision = 16;                 // etcd mod revision (for tracking)
+  uint64 version_num = 17;                  // Key version in etcd
+
+  // NOTE: For actual service registration and discovery, use AtappDiscovery from atapp_conf.proto
+  // which includes: runtime, atbus_protocol_version, atbus_protocol_min_version, atbus_subnets
+}
