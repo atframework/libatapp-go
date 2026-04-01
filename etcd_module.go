@@ -1,10 +1,7 @@
 package libatapp
 
 import (
-	"github.com/atframework/libatapp-go/etcd_module/discovery"
-	"github.com/atframework/libatapp-go/etcd_module/events"
-	moduleimpl "github.com/atframework/libatapp-go/etcd_module/module"
-	"github.com/atframework/libatapp-go/etcd_module/registration"
+	modulev2 "github.com/atframework/libatapp-go/etcd_module_v2"
 	atframe_protocol "github.com/atframework/libatapp-go/protocol/atframe"
 )
 
@@ -20,48 +17,51 @@ type EtcdAppModuleImpl interface {
 // ============ 服务发现数据和事件相关定义 ============
 
 // EtcdDiscoveryAction represents the action type for discovery node events.
-type EtcdDiscoveryAction = moduleimpl.DiscoveryAction
+type EtcdDiscoveryAction int
 
 const (
-	EtcdDiscoveryActionUnknown EtcdDiscoveryAction = moduleimpl.DiscoveryActionUnknown
-	EtcdDiscoveryActionPut     EtcdDiscoveryAction = moduleimpl.DiscoveryActionPut
-	EtcdDiscoveryActionDelete  EtcdDiscoveryAction = moduleimpl.DiscoveryActionDelete
+	EtcdDiscoveryActionUnknown EtcdDiscoveryAction = 0
+	EtcdDiscoveryActionPut     EtcdDiscoveryAction = 1
+	EtcdDiscoveryActionDelete  EtcdDiscoveryAction = 2
 )
 
 // EtcdWatchEvent represents the event type for etcd watch operations.
-type EtcdWatchEvent = moduleimpl.TopologyAction
+type EtcdWatchEvent int
 
 const (
-	EtcdWatchEventUnknown EtcdWatchEvent = moduleimpl.TopologyActionUnknown
-	EtcdWatchEventPut     EtcdWatchEvent = moduleimpl.TopologyActionPut
-	EtcdWatchEventDelete  EtcdWatchEvent = moduleimpl.TopologyActionDelete
+	EtcdWatchEventUnknown EtcdWatchEvent = 0
+	EtcdWatchEventPut     EtcdWatchEvent = 1
+	EtcdWatchEventDelete  EtcdWatchEvent = 2
 )
 
 // EtcdResponseHeader reuses the generated proto type.
 type EtcdResponseHeader = atframe_protocol.EtcdResponseHeader
 
 // EtcdDataVersion represents version information for etcd data.
-type EtcdDataVersion struct {
-	CreateRevision int64
-	ModRevision    int64
-	Version        int64
-}
+type EtcdDataVersion = modulev2.DataVersion
 
 // EtcdDiscoveryNodeVersion represents version info for a discovery node.
-type EtcdDiscoveryNodeVersion struct {
-	CreateRevision int64
-	ModRevision    int64
-	Version        int64
+type EtcdDiscoveryNodeVersion = modulev2.DataVersion
+
+// EtcdDiscoveryNode reuses v2 discovery node read-model.
+type EtcdDiscoveryNode = modulev2.DiscoveryNode
+
+// EtcdDiscoverySet reuses v2 discovery set read-model.
+type EtcdDiscoverySet = modulev2.DiscoverySetSnapshot
+
+// EtcdRegistration is a legacy path token returned by registration APIs.
+// Keepalive ownership is in v2 module internals.
+type EtcdRegistration struct {
+	path string
 }
 
-// EtcdDiscoveryNode reuses discovery node model from etcd_module package.
-type EtcdDiscoveryNode = discovery.DiscoveryNode
-
-// EtcdDiscoverySet reuses discovery set model from etcd_module package.
-type EtcdDiscoverySet = discovery.EtcdDiscoverySet
-
-// EtcdRegistration is the canonical registration actor model.
-type EtcdRegistration = registration.EtcdRegistration
+// GetPath returns the registration key path.
+func (r *EtcdRegistration) GetPath() string {
+	if r == nil {
+		return ""
+	}
+	return r.path
+}
 
 // NodeInfo represents discovery node information with an associated action.
 type NodeInfo struct {
@@ -82,31 +82,25 @@ type TopologyStorage struct {
 	Version EtcdDataVersion
 }
 
-// TopologyInfo represents topology data with an associated action.
-type TopologyInfo struct {
-	Storage TopologyStorage
-	Action  EtcdWatchEvent
-}
-
-// TopologyList represents a list of topology information entries.
-type TopologyList struct {
-	Topologies []TopologyInfo
+// DiscoveryNodeStorage stores discovery node information with version.
+type DiscoveryNodeStorage struct {
+	Info    *atframe_protocol.AtappDiscovery
+	Version EtcdDataVersion
 }
 
 // ============ Watcher 回调参数 ============
 
 // DiscoveryWatcherSender carries context for a discovery watcher callback invocation.
 type DiscoveryWatcherSender struct {
-	Module     EtcdModuleImpl
-	EtcdHeader *EtcdResponseHeader
-	Node       *NodeInfo
+	Module EtcdModuleImpl
+	Node   *NodeInfo
 }
 
 // TopologyWatcherSender carries context for a topology watcher callback invocation.
 type TopologyWatcherSender struct {
-	Module     EtcdModuleImpl
-	EtcdHeader *EtcdResponseHeader
-	Topology   *TopologyInfo
+	Module   EtcdModuleImpl
+	Topology *TopologyStorage
+	Action   EtcdWatchEvent
 }
 
 // ============ 回调类型 ============
@@ -118,8 +112,8 @@ type TopologySnapshotEventCallback func(EtcdModuleImpl)
 type NodeEventCallback func(EtcdDiscoveryAction, *EtcdDiscoveryNode)
 type TopologyInfoEventCallback func(EtcdWatchEvent, *atframe_protocol.AtappTopologyInfo, *EtcdDataVersion)
 
-// EventCallbackHandle reuses callback handle type from etcd_module events package.
-type EventCallbackHandle = events.EventCallbackHandle
+// EventCallbackHandle identifies a registered callback in this module.
+type EventCallbackHandle int64
 
 type EtcdModuleImpl interface {
 	// Reset clears all internal state.
@@ -160,14 +154,10 @@ type EtcdModuleImpl interface {
 	AddDiscoveryWatcherByName(fn DiscoveryWatcherListCallback) error
 	AddTopologyWatcher(fn TopologyWatcherListCallback) error
 
-	// --- Etcd 事件头 ---
-
-	GetLastEtcdEventTopologyHeader() *EtcdResponseHeader
-	GetLastEtcdEventDiscoveryHeader() *EtcdResponseHeader
-
 	// --- Registration Actor ---
 
-	AddRegistrationActor(val *string, nodePath string) *EtcdRegistration
+	AddRegistrationDiscoveryActor(val *atframe_protocol.AtappDiscovery, nodePath string) *EtcdRegistration
+	AddRegistrationTopologyActor(val *atframe_protocol.AtappTopologyInfo, nodePath string) *EtcdRegistration
 	RemoveRegistrationActor(registration *EtcdRegistration) bool
 
 	// --- 节点发现事件 ---
@@ -187,6 +177,10 @@ type EtcdModuleImpl interface {
 	// --- 拓扑信息集合 ---
 
 	GetTopologyInfoSet() map[uint64]*TopologyStorage
+
+	// --- Discovery 节点集合 ---
+
+	GetDiscoveryNodeSet() map[string]*DiscoveryNodeStorage
 
 	// --- Discovery 快照 ---
 

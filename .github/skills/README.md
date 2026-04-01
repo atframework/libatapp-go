@@ -8,3 +8,4 @@
 - `config-expression.md` — 配置加载与表达式展开功能
 - `architecture.md` — 模块架构与核心数据流
 - `testing.md` — 测试规范与运行方法
+- `actor-csp-migration/SKILL.md` — etcd_module Actor/CSP 并发模型迁移（Phase 1-5）
