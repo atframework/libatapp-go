@@ -73,6 +73,9 @@ func EventTypeName(t EventType) string {
 // WatchNodePayload is the Payload for EventWatchNodeUp, Down, and Update.
 type WatchNodePayload = orchestrator.WatchNodePayload
 
+// WatchSnapshotLoadingPayload is the Payload for EventWatchSnapshotLoading.
+type WatchSnapshotLoadingPayload = orchestrator.WatchSnapshotLoadingPayload
+
 // WatchSnapshotLoadedPayload is the Payload for EventWatchSnapshotLoaded.
 type WatchSnapshotLoadedPayload = orchestrator.WatchSnapshotLoadedPayload
 

@@ -204,7 +204,7 @@ func (a *WatchActor) startStream(ctx context.Context, prefix string) {
 		if isTopology {
 			a.publishTopologySnapshotLoading()
 		} else {
-			a.publishSnapshotLoading()
+			a.publishSnapshotLoading(prefix)
 		}
 
 		getCtx, getCancel := context.WithTimeout(streamCtx, 30*time.Second)
@@ -237,7 +237,7 @@ func (a *WatchActor) startStream(ctx context.Context, prefix string) {
 					nodes[string(kv.Key)] = node
 				}
 			}
-			a.publishSnapshotLoaded(nodes, resp.Header.GetRevision())
+			a.publishSnapshotLoaded(nodes, resp.Header.GetRevision(), prefix)
 		}
 
 		watchCh := a.etcdClient.Watch(
@@ -334,22 +334,23 @@ func (a *WatchActor) dispatchTopologyKVEvent(ev *clientv3.Event, revision int64)
 
 // ── Snapshot publishing ───────────────────────────────────────────────────
 
-func (a *WatchActor) publishSnapshotLoading() {
+func (a *WatchActor) publishSnapshotLoading(prefix string) {
 	a.eventBus.Publish(runtime.EventEnvelope{
 		Type:       runtime.EventWatchSnapshotLoading,
 		Version:    1,
 		Source:     runtime.EventSourceWatchActor,
 		OccurredAt: time.Now(),
+		Payload:    WatchSnapshotLoadingPayload{Prefix: prefix},
 	})
 }
 
-func (a *WatchActor) publishSnapshotLoaded(nodes map[string]*snapshot.DiscoveryNode, revision int64) {
+func (a *WatchActor) publishSnapshotLoaded(nodes map[string]*snapshot.DiscoveryNode, revision int64, prefix string) {
 	a.eventBus.Publish(runtime.EventEnvelope{
 		Type:       runtime.EventWatchSnapshotLoaded,
 		Version:    1,
 		Source:     runtime.EventSourceWatchActor,
 		OccurredAt: time.Now(),
-		Payload:    WatchSnapshotLoadedPayload{Nodes: nodes, Revision: revision},
+		Payload:    WatchSnapshotLoadedPayload{Prefix: prefix, Nodes: nodes, Revision: revision},
 	})
 }
 

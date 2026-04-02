@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -84,6 +85,13 @@ type ProjectionActor struct {
 	// version monotonically incremented on each publish.
 	version uint64
 
+	// discLoadingPrefixes tracks discovery watch prefixes that are currently
+	// in the loading (not-ready) state.  Discovery.Ready is true only when
+	// this set is empty.  This lets multiple simultaneous streams (e.g.
+	// /by_id and /by_name) each supply their own nodes without the second
+	// stream overwriting nodes loaded by the first.
+	discLoadingPrefixes map[string]struct{}
+
 	// internal mutable sub-state (only touched in Run goroutine)
 	discovery snapshot.DiscoverySetSnapshot
 	topology  snapshot.TopologySnapshot
@@ -93,10 +101,11 @@ type ProjectionActor struct {
 // NewProjectionActor creates a ProjectionActor.  onPublish may be nil.
 func NewProjectionActor(bus runtime.EventBus, onPublish SnapshotCallback) *ProjectionActor {
 	a := &ProjectionActor{
-		ActorBase:   runtime.NewActorBase[projMsg](256),
-		eventBus:    bus,
-		onPublish:   onPublish,
-		dedupeCache: make(map[string]struct{}),
+		ActorBase:           runtime.NewActorBase[projMsg](256),
+		eventBus:            bus,
+		onPublish:           onPublish,
+		dedupeCache:         make(map[string]struct{}),
+		discLoadingPrefixes: make(map[string]struct{}),
 	}
 	a.discovery.NodesByPath = make(map[string]*snapshot.DiscoveryNode)
 	a.topology.NodesByID = make(map[uint64]*snapshot.TopologyNode)
@@ -158,14 +167,14 @@ func (a *ProjectionActor) onApply(env runtime.EventEnvelope) {
 	case runtime.EventLeaseExpired:
 		a.reg = snapshot.RegistrationSnapshot{}
 		a.currentLeaseEpoch = env.LeaseEpoch
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseRegistration)
 
 	case runtime.EventLeaseGranted:
 		a.currentLeaseEpoch = env.LeaseEpoch
 
 	case runtime.EventLeaseReleased:
 		a.reg = snapshot.RegistrationSnapshot{}
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseRegistration)
 
 	// ── Registration events ─────────────────────────────────────────────
 	case runtime.EventRegistrationChanged:
@@ -176,25 +185,51 @@ func (a *ProjectionActor) onApply(env runtime.EventEnvelope) {
 		pl := env.Payload.(RegistrationChangedPayload)
 		a.reg = *pl.RegistrationSnapshot.Clone()
 		a.currentLeaseEpoch = env.LeaseEpoch
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseRegistration)
 
 	// ── Watch events ─────────────────────────────────────────────────────
 	case runtime.EventWatchSnapshotLoading:
-		// Clear discovery snapshot; watch snapshot is being rebuilt.
-		a.discovery = snapshot.DiscoverySetSnapshot{
-			Ready:       false,
-			NodesByPath: make(map[string]*snapshot.DiscoveryNode),
+		// Mark this prefix as loading and evict its stale nodes.
+		// Nodes from OTHER prefixes remain intact, preserving their data while
+		// this stream rebuilds.  Ready becomes false until all loading prefixes
+		// have completed their initial snapshot.
+		var prefix string
+		if pl, ok := env.Payload.(WatchSnapshotLoadingPayload); ok {
+			prefix = pl.Prefix
 		}
+		a.discLoadingPrefixes[prefix] = struct{}{}
+		for path := range a.discovery.NodesByPath {
+			if prefix == "" || strings.HasPrefix(path, prefix) {
+				delete(a.discovery.NodesByPath, path)
+			}
+		}
+		a.discovery.Ready = false
+		a.publishSnapshot(snapshot.SnapshotCauseDiscovery)
 
 	case runtime.EventWatchSnapshotLoaded:
 		pl := env.Payload.(WatchSnapshotLoadedPayload)
-		a.discovery = snapshot.DiscoverySetSnapshot{
-			Ready:        true,
-			LastRevision: pl.Revision,
-			NodesByPath:  pl.Nodes,
+		// Remove stale nodes for this prefix before merging the new snapshot.
+		// Nodes from other concurrent prefixes are left untouched.
+		if pl.Prefix != "" {
+			for path := range a.discovery.NodesByPath {
+				if strings.HasPrefix(path, pl.Prefix) {
+					delete(a.discovery.NodesByPath, path)
+				}
+			}
+		} else {
+			a.discovery.NodesByPath = make(map[string]*snapshot.DiscoveryNode)
 		}
+		for path, node := range pl.Nodes {
+			a.discovery.NodesByPath[path] = node
+		}
+		if pl.Revision > a.discovery.LastRevision {
+			a.discovery.LastRevision = pl.Revision
+		}
+		// Mark this prefix as done loading; Ready = true when all are done.
+		delete(a.discLoadingPrefixes, pl.Prefix)
+		a.discovery.Ready = len(a.discLoadingPrefixes) == 0
 		a.discovery.RebuildIndexes()
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseDiscovery)
 
 	case runtime.EventWatchTopologySnapshotLoaded:
 		pl := env.Payload.(WatchTopologySnapshotLoadedPayload)
@@ -207,7 +242,7 @@ func (a *ProjectionActor) onApply(env runtime.EventEnvelope) {
 		if len(pl.Nodes) > 0 {
 			a.topology.RebuildIndexes()
 		}
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseTopology)
 
 	case runtime.EventWatchNodeUp, runtime.EventWatchNodeUpdate:
 		pl := env.Payload.(WatchNodePayload)
@@ -219,7 +254,7 @@ func (a *ProjectionActor) onApply(env runtime.EventEnvelope) {
 		if pl.Revision > a.discovery.LastRevision {
 			a.discovery.LastRevision = pl.Revision
 		}
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseDiscovery)
 
 	case runtime.EventWatchNodeDown:
 		pl := env.Payload.(WatchNodePayload)
@@ -227,7 +262,7 @@ func (a *ProjectionActor) onApply(env runtime.EventEnvelope) {
 		if pl.Revision > a.discovery.LastRevision {
 			a.discovery.LastRevision = pl.Revision
 		}
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseDiscovery)
 
 	case runtime.EventWatchTopologyUp, runtime.EventWatchTopologyUpdate:
 		pl := env.Payload.(WatchTopologyPayload)
@@ -238,7 +273,7 @@ func (a *ProjectionActor) onApply(env runtime.EventEnvelope) {
 		if pl.Revision > a.topology.LastRevision {
 			a.topology.LastRevision = pl.Revision
 		}
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseTopology)
 
 	case runtime.EventWatchTopologyDown:
 		pl := env.Payload.(WatchTopologyPayload)
@@ -249,7 +284,7 @@ func (a *ProjectionActor) onApply(env runtime.EventEnvelope) {
 		if pl.Revision > a.topology.LastRevision {
 			a.topology.LastRevision = pl.Revision
 		}
-		a.publishSnapshot()
+		a.publishSnapshot(snapshot.SnapshotCauseTopology)
 	}
 }
 
@@ -260,16 +295,18 @@ func (a *ProjectionActor) onReset() {
 	}
 	a.reg = snapshot.RegistrationSnapshot{}
 	a.dedupeCache = make(map[string]struct{})
-	a.publishSnapshot()
+	a.discLoadingPrefixes = make(map[string]struct{})
+	a.publishSnapshot(snapshot.SnapshotCauseReset)
 }
 
 // ── Snapshot assembly & atomic publish ───────────────────────────────────
 
-func (a *ProjectionActor) publishSnapshot() {
+func (a *ProjectionActor) publishSnapshot(cause snapshot.SnapshotCause) {
 	a.version++
 	snap := &snapshot.ExportSnapshot{
 		Version:      a.version,
 		PublishedAt:  time.Now(),
+		Cause:        cause,
 		Discovery:    *a.discovery.Clone(),
 		Topology:     *a.topology.Clone(),
 		Registration: *a.reg.Clone(),

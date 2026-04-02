@@ -279,6 +279,23 @@ func betterNode(current *TopologyNode, candidate *TopologyNode) bool {
 	return false
 }
 
+// ── SnapshotCause ────────────────────────────────────────────────────────
+
+// SnapshotCause identifies which sub-tree triggered the publish.
+// Consumers may use it to skip diffing the unaffected sub-tree.
+type SnapshotCause uint8
+
+const (
+	// SnapshotCauseReset is the zero value: full reset or initial publish.
+	SnapshotCauseReset SnapshotCause = 0
+	// SnapshotCauseDiscovery means only the Discovery sub-tree changed.
+	SnapshotCauseDiscovery SnapshotCause = 1
+	// SnapshotCauseTopology means only the Topology sub-tree changed.
+	SnapshotCauseTopology SnapshotCause = 2
+	// SnapshotCauseRegistration means only the Registration sub-tree changed.
+	SnapshotCauseRegistration SnapshotCause = 3
+)
+
 // ── ExportSnapshot ────────────────────────────────────────────────────────
 
 // ExportSnapshot is the single, atomically-published read-model exported by
@@ -288,6 +305,8 @@ type ExportSnapshot struct {
 	// Version is monotonically incremented on every atomic publish.
 	Version      uint64
 	PublishedAt  time.Time
+	// Cause identifies which sub-tree triggered this publish.
+	Cause        SnapshotCause
 	Discovery    DiscoverySetSnapshot
 	Topology     TopologySnapshot
 	Registration RegistrationSnapshot

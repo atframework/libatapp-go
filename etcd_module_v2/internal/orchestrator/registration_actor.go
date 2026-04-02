@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
 
+	"github.com/atframework/libatapp-go/etcd_module_v2/internal/codec"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/pathbuilder"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/runtime"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/snapshot"
@@ -571,7 +572,7 @@ func (a *RegistrationActor) putDiscoveryWithLease(svc discoveryRegistrationEntry
 
 	leaseOpt := clientv3.WithLease(a.st.leaseID)
 
-	infoBytes, err := proto.Marshal(svc.info)
+	infoBytes, err := codec.MarshalDiscoveryToJSON(svc.info)
 	if err != nil {
 		return fmt.Errorf("marshal discovery info: %w", err)
 	}
@@ -612,7 +613,7 @@ func (a *RegistrationActor) putTopologyWithLease(svc topologyRegistrationEntry) 
 		return nil
 	}
 
-	topologyBytes, err := proto.Marshal(svc.info)
+	topologyBytes, err := codec.MarshalTopologyToJSON(svc.info)
 	if err != nil {
 		return fmt.Errorf("marshal topology info: %w", err)
 	}

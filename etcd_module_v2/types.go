@@ -45,6 +45,16 @@ type TopologyNode = snapshot.TopologyNode
 // DataVersion is the public etcd key version tuple used by v2 snapshots.
 type DataVersion = etcdversion.DataVersion
 
+// SnapshotCause identifies which sub-tree triggered a snapshot publish.
+type SnapshotCause = snapshot.SnapshotCause
+
+const (
+	SnapshotCauseReset        = snapshot.SnapshotCauseReset
+	SnapshotCauseDiscovery    = snapshot.SnapshotCauseDiscovery
+	SnapshotCauseTopology     = snapshot.SnapshotCauseTopology
+	SnapshotCauseRegistration = snapshot.SnapshotCauseRegistration
+)
+
 // ── Watcher callback types ────────────────────────────────────────────────
 
 // SnapshotCallback is invoked on the ProjectionActor's run goroutine whenever

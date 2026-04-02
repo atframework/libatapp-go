@@ -25,5 +25,8 @@ type EtcdClient interface {
 	Grant(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error)
 	Revoke(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error)
 	KeepAlive(ctx context.Context, id clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error)
+	// SetEndpoints hot-replaces the endpoint list on the underlying connection.
+	// Called by EtcdModule.UpdateEndpoints for soft-reload support.
+	SetEndpoints(endpoints ...string)
 	Close() error
 }

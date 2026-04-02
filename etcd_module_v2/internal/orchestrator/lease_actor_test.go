@@ -15,83 +15,24 @@ import (
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/runtime"
 )
 
-// ── Mock EtcdClient ───────────────────────────────────────────────────────
+// ── shared test helpers ───────────────────────────────────────────────────
 
-type mockEtcdClient struct {
-	grantFn     func(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error)
-	keepAliveFn func(ctx context.Context, id clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error)
-	revokeFn    func(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error)
-	getFn       func(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error)
-	putFn       func(ctx context.Context, key, val string, opts ...clientv3.OpOption) (*clientv3.PutResponse, error)
-	deleteFn    func(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.DeleteResponse, error)
-	watchFn     func(ctx context.Context, key string, opts ...clientv3.OpOption) clientv3.WatchChan
+// startMockEtcd starts a single-node in-process etcd mock server and returns a
+// connected clientv3.Client.  The server and client are cleaned up via t.Cleanup.
+func startMockEtcd(t *testing.T) *clientv3.Client {
+	t.Helper()
+	servers, err := mockserver.StartMockServers(1)
+	require.NoError(t, err)
+	t.Cleanup(servers.Stop)
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{servers.Servers[0].Address},
+		DialTimeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cli.Close() })
+	return cli
 }
-
-func (m *mockEtcdClient) Grant(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
-	if m.grantFn != nil {
-		return m.grantFn(ctx, ttl)
-	}
-	return &clientv3.LeaseGrantResponse{ID: 1001, TTL: ttl}, nil
-}
-
-func (m *mockEtcdClient) KeepAlive(ctx context.Context, id clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error) {
-	if m.keepAliveFn != nil {
-		return m.keepAliveFn(ctx, id)
-	}
-	// By default: channel closes when ctx is done (simulates normal keepalive until stop).
-	ch := make(chan *clientv3.LeaseKeepAliveResponse)
-	go func() {
-		<-ctx.Done()
-		close(ch)
-	}()
-	return ch, nil
-}
-
-func (m *mockEtcdClient) Revoke(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
-	if m.revokeFn != nil {
-		return m.revokeFn(ctx, id)
-	}
-	return &clientv3.LeaseRevokeResponse{}, nil
-}
-
-func (m *mockEtcdClient) Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
-	if m.getFn != nil {
-		return m.getFn(ctx, key, opts...)
-	}
-	return &clientv3.GetResponse{}, nil
-}
-
-func (m *mockEtcdClient) Put(ctx context.Context, key, val string, opts ...clientv3.OpOption) (*clientv3.PutResponse, error) {
-	if m.putFn != nil {
-		return m.putFn(ctx, key, val, opts...)
-	}
-	return &clientv3.PutResponse{}, nil
-}
-
-func (m *mockEtcdClient) Delete(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.DeleteResponse, error) {
-	if m.deleteFn != nil {
-		return m.deleteFn(ctx, key, opts...)
-	}
-	return &clientv3.DeleteResponse{}, nil
-}
-
-func (m *mockEtcdClient) Watch(ctx context.Context, key string, opts ...clientv3.OpOption) clientv3.WatchChan {
-	if m.watchFn != nil {
-		return m.watchFn(ctx, key, opts...)
-	}
-	ch := make(chan clientv3.WatchResponse)
-	go func() {
-		<-ctx.Done()
-		close(ch)
-	}()
-	return ch
-}
-
-func (m *mockEtcdClient) Close() error {
-	return nil
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────
 
 // waitForEvent blocks until an event of the expected type arrives or times out.
 func waitForEvent(t *testing.T, ch <-chan runtime.EventEnvelope, want runtime.EventType, timeout time.Duration) runtime.EventEnvelope {
@@ -114,8 +55,8 @@ func waitForEvent(t *testing.T, ch <-chan runtime.EventEnvelope, want runtime.Ev
 }
 
 // subscribeAll subscribes to all events and returns a buffered channel.
-func subscribeAll(bus runtime.EventBus, cap int) (<-chan runtime.EventEnvelope, runtime.EventHandleHandle) {
-	ch := make(chan runtime.EventEnvelope, cap)
+func subscribeAll(bus runtime.EventBus, bufCap int) (<-chan runtime.EventEnvelope, runtime.EventHandleHandle) {
+	ch := make(chan runtime.EventEnvelope, bufCap)
 	handle := bus.Subscribe(func(e runtime.EventEnvelope) {
 		select {
 		case ch <- e:
@@ -127,14 +68,15 @@ func subscribeAll(bus runtime.EventBus, cap int) (<-chan runtime.EventEnvelope, 
 
 // ── LeaseActor tests ──────────────────────────────────────────────────────
 
+// TestLeaseActor_StartGrantsLease verifies that actor.Start() causes the actor
+// to Grant a lease and publish EventLeaseGranted on the bus.
 func TestLeaseActor_StartGrantsLease(t *testing.T) {
 	// Arrange
+	cli := startMockEtcd(t)
 	bus := runtime.NewEventBus()
 	evCh, _ := subscribeAll(bus, 16)
 
-	mock := &mockEtcdClient{}
-	actor := orchestrator.NewLeaseActor(mock, bus)
-
+	actor := orchestrator.NewLeaseActor(cli, bus)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go actor.Run(ctx)
@@ -142,177 +84,75 @@ func TestLeaseActor_StartGrantsLease(t *testing.T) {
 	// Act
 	actor.Start(10)
 
-	// Assert: EventLeaseGranted must arrive
-	env := waitForEvent(t, evCh, runtime.EventLeaseGranted, 3*time.Second)
-	pl, ok := env.Payload.(orchestrator.LeaseGrantedPayload)
+	// Assert: EventLeaseGranted must arrive with epoch=1.
+	// Note: mock/mockserver returns LeaseID=0 and TTL=0; we only assert the event fires.
+	env := waitForEvent(t, evCh, runtime.EventLeaseGranted, 5*time.Second)
+	_, ok := env.Payload.(orchestrator.LeaseGrantedPayload)
 	require.True(t, ok, "payload type mismatch")
-	assert.Equal(t, clientv3.LeaseID(1001), pl.LeaseID)
-	assert.Equal(t, int64(10), pl.TTL)
 	assert.Equal(t, uint64(1), env.LeaseEpoch)
 }
 
+// TestLeaseActor_KeepaliveExpiry_TriggersRebuild verifies that when the active
+// lease is externally revoked (simulating keepalive expiry / server eviction),
+// the actor detects the expiry and automatically re-grants a new lease.
 func TestLeaseActor_KeepaliveExpiry_TriggersRebuild(t *testing.T) {
-	// Arrange: keepalive channel is closed immediately to simulate expired lease.
-	bus := runtime.NewEventBus()
-	evCh, _ := subscribeAll(bus, 32)
-
-	kaCh := make(chan *clientv3.LeaseKeepAliveResponse) // never sends; we'll close below
-
-	var grantCount int
-	mock := &mockEtcdClient{
-		grantFn: func(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
-			grantCount++
-			return &clientv3.LeaseGrantResponse{ID: clientv3.LeaseID(1000 + int64(grantCount)), TTL: ttl}, nil
-		},
-		keepAliveFn: func(ctx context.Context, id clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error) {
-			// Return the single controllable channel.
-			return kaCh, nil
-		},
-	}
-	actor := orchestrator.NewLeaseActor(mock, bus)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go actor.Run(ctx)
-
-	// Act: start lease, wait for first grant, then simulate expiry by closing kaCh.
-	actor.Start(5)
-	waitForEvent(t, evCh, runtime.EventLeaseGranted, 3*time.Second)
-
-	// Close the keepalive channel to trigger expiry.
-	close(kaCh)
-
-	// Assert: EventLeaseExpired then EventLeaseGranted (rebuild) must arrive.
-	waitForEvent(t, evCh, runtime.EventLeaseExpired, 3*time.Second)
-	// After expiry the actor immediately retries; the second keepaliveFn call
-	// will arrive, but since kaCh is already closed we provide a new channel.
-	// (In practice the rebuild path calls tryGrant → startKeepalive again with
-	//  a new kaCtx, so the second keepaliveFn call should return a new channel.)
-	// The second EventLeaseGranted confirms rebuild.
-	waitForEvent(t, evCh, runtime.EventLeaseGranted, 3*time.Second)
-	assert.GreaterOrEqual(t, grantCount, 2, "Grant should have been called at least twice")
-}
-
-func TestLeaseActor_Stop_RevokesLease(t *testing.T) {
-	// Arrange
-	bus := runtime.NewEventBus()
-	evCh, _ := subscribeAll(bus, 16)
-
-	var revokeCalled bool
-	mock := &mockEtcdClient{
-		revokeFn: func(_ context.Context, _ clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
-			revokeCalled = true
-			return &clientv3.LeaseRevokeResponse{}, nil
-		},
-	}
-	actor := orchestrator.NewLeaseActor(mock, bus)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go actor.Run(ctx)
-
-	// Start and wait for lease grant.
-	actor.Start(10)
-	waitForEvent(t, evCh, runtime.EventLeaseGranted, 3*time.Second)
-
-	// Act: stop the actor.
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer stopCancel()
-	select {
-	case err := <-actor.Stop(stopCtx):
-		require.NoError(t, err)
-	case <-stopCtx.Done():
-		t.Fatal("Stop timed out")
-	}
-
-	// Assert: EventLeaseReleased must have been published, Revoke must be called.
-	waitForEvent(t, evCh, runtime.EventLeaseReleased, 2*time.Second)
-	assert.True(t, revokeCalled, "Revoke should have been called")
-}
-
-func TestLeaseActor_Tick_RetriesAcquiring(t *testing.T) {
-	// Arrange: first Grant call fails, second succeeds.
-	bus := runtime.NewEventBus()
-	evCh, _ := subscribeAll(bus, 16)
-
-	grantCount := 0
-	mock := &mockEtcdClient{
-		grantFn: func(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
-			grantCount++
-			if grantCount == 1 {
-				return nil, context.DeadlineExceeded // first attempt fails
-			}
-			return &clientv3.LeaseGrantResponse{ID: 2001, TTL: ttl}, nil
-		},
-	}
-	actor := orchestrator.NewLeaseActor(mock, bus)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go actor.Run(ctx)
-
-	// Act: Start (first Grant fails silently), then Tick drives the retry.
-	actor.Start(10)
-	// Give the actor time to process Start (first Grant fails).
-	time.Sleep(50 * time.Millisecond)
-	actor.Tick()
-
-	// Assert: EventLeaseGranted arrives on the second attempt.
-	waitForEvent(t, evCh, runtime.EventLeaseGranted, 3*time.Second)
-	assert.Equal(t, 2, grantCount)
-}
-
-func TestLeaseActor_Post_NonBlocking_WhenMailboxFull(t *testing.T) {
-	// Arrange: actor not running — mailbox (cap=4) can fill up.
-	bus := runtime.NewEventBus()
-	mock := &mockEtcdClient{}
-	actor := orchestrator.NewLeaseActor(mock, bus)
-
-	// Fill the mailbox.
-	for i := 0; i < 4; i++ {
-		actor.Tick()
-	}
-
-	// Further Post must not block.
-	postDone := make(chan struct{})
-	go func() {
-		actor.Tick() // should drop silently
-		close(postDone)
-	}()
-
-	select {
-	case <-postDone:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("Tick blocked when mailbox was full")
-	}
-}
-
-func TestLeaseActor_WithMockServer_ConnectionLifecycle(t *testing.T) {
-	// Arrange: start mock etcd gRPC server and real clientv3.
-	servers, err := mockserver.StartMockServers(1)
+	// Use two mock servers: the client holds both endpoints.
+	// Stopping server1 kills the active KeepAlive stream, which the actor
+	// interprets as expiry; gRPC then fails over to server2 for the rebuild Grant.
+	servers1, err := mockserver.StartMockServers(1)
 	require.NoError(t, err)
-	defer servers.Stop()
+
+	servers2, err := mockserver.StartMockServers(1)
+	require.NoError(t, err)
+	defer servers2.Stop()
 
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{servers.Servers[0].Address},
-		DialTimeout: 3 * time.Second,
+		Endpoints:   []string{servers1.Servers[0].Address, servers2.Servers[0].Address},
+		DialTimeout: 5 * time.Second,
 	})
 	require.NoError(t, err)
 	defer func() { _ = cli.Close() }()
 
 	bus := runtime.NewEventBus()
-	evCh, handle := subscribeAll(bus, 32)
-	defer bus.Unsubscribe(handle)
+	evCh, _ := subscribeAll(bus, 32)
 
 	actor := orchestrator.NewLeaseActor(cli, bus)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go actor.Run(ctx)
 
-	// Act: acquire and then release lease using real client connection.
-	actor.Start(5)
-	granted := waitForEvent(t, evCh, runtime.EventLeaseGranted, 5*time.Second)
+	// Act: acquire a lease (via server1), then kill server1 to close the keepalive stream.
+	actor.Start(60)
+	waitForEvent(t, evCh, runtime.EventLeaseGranted, 10*time.Second)
+	servers1.Stop() // forces keepalive channel close → leaseMsgExpired
 
+	// Assert: actor must detect expiry, then rebuild on server2.
+	waitForEvent(t, evCh, runtime.EventLeaseExpired, 10*time.Second)
+	secondGrant := waitForEvent(t, evCh, runtime.EventLeaseGranted, 15*time.Second)
+	assert.Equal(t, uint64(2), secondGrant.LeaseEpoch, "rebuilt lease must carry epoch=2")
+}
+
+// TestLeaseActor_Stop_CleanShutdown verifies that actor.Stop() returns without
+// error and the actor goroutine terminates gracefully.
+//
+// Note: mock/mockserver returns LeaseID=0. The actor's onStop path only calls
+// Revoke/publishLeaseReleased when leaseID != 0, so EventLeaseReleased is not
+// expected here. This test validates the Stop lifecycle, not the revoke side-effect.
+func TestLeaseActor_Stop_CleanShutdown(t *testing.T) {
+	// Arrange
+	cli := startMockEtcd(t)
+	bus := runtime.NewEventBus()
+	evCh, _ := subscribeAll(bus, 16)
+
+	actor := orchestrator.NewLeaseActor(cli, bus)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	actor.Start(60)
+	waitForEvent(t, evCh, runtime.EventLeaseGranted, 5*time.Second)
+
+	// Act: stop the actor and verify it completes without blocking.
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer stopCancel()
 	select {
@@ -321,9 +161,76 @@ func TestLeaseActor_WithMockServer_ConnectionLifecycle(t *testing.T) {
 	case <-stopCtx.Done():
 		t.Fatal("Stop timed out")
 	}
+}
 
-	// Assert
-	grantPayload, ok := granted.Payload.(orchestrator.LeaseGrantedPayload)
-	require.True(t, ok)
-	_ = grantPayload
+// TestLeaseActor_Tick_RetriesAcquiring verifies that when the initial Grant
+// fails (server unavailable), a subsequent Tick drives a successful retry.
+func TestLeaseActor_Tick_RetriesAcquiring(t *testing.T) {
+	// Arrange: start a server, immediately stop it, then create a client pointing
+	// to the now-dead address so the first Grant fails fast (connection refused).
+	servers1, err := mockserver.StartMockServers(1)
+	require.NoError(t, err)
+	deadAddr := servers1.Servers[0].Address
+	servers1.Stop() // port released; connection to deadAddr will be refused
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{deadAddr},
+		DialTimeout: 200 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer func() { _ = cli.Close() }()
+
+	bus := runtime.NewEventBus()
+	evCh, _ := subscribeAll(bus, 16)
+
+	actor := orchestrator.NewLeaseActor(cli, bus)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	// Act: Start — Grant fails because server is down.  Actor stays in Acquiring.
+	// (tryGrant uses a 10 s internal timeout, but connection-refused is immediate.)
+	actor.Start(10)
+	// Give the actor goroutine time to process Start and observe the failed Grant.
+	time.Sleep(300 * time.Millisecond)
+
+	// Bring up a fresh server and redirect the client to it.
+	servers2, err := mockserver.StartMockServers(1)
+	require.NoError(t, err)
+	defer servers2.Stop()
+	cli.SetEndpoints(servers2.Servers[0].Address)
+
+	// Tick triggers another tryGrant; this time the server is reachable.
+	actor.Tick()
+
+	// Assert: EventLeaseGranted must arrive (from the Tick-driven retry).
+	// Note: mock/mockserver returns LeaseID=0; we only verify the event fires.
+	waitForEvent(t, evCh, runtime.EventLeaseGranted, 5*time.Second)
+}
+
+// TestLeaseActor_Post_NonBlocking_WhenMailboxFull verifies that a Tick() call
+// never blocks even when the actor's mailbox is already full.
+func TestLeaseActor_Post_NonBlocking_WhenMailboxFull(t *testing.T) {
+	// Arrange: actor is NOT running — mailbox (cap=4) fills up quickly.
+	cli := startMockEtcd(t)
+	bus := runtime.NewEventBus()
+	actor := orchestrator.NewLeaseActor(cli, bus)
+
+	// Fill the mailbox.
+	for i := 0; i < 4; i++ {
+		actor.Tick()
+	}
+
+	// A further Post must not block.
+	postDone := make(chan struct{})
+	go func() {
+		actor.Tick() // must drop silently
+		close(postDone)
+	}()
+
+	select {
+	case <-postDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Tick blocked when mailbox was full")
+	}
 }

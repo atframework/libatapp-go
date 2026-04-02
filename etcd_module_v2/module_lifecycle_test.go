@@ -82,6 +82,8 @@ func (m *testMockEtcdClient) Watch(ctx context.Context, key string, opts ...clie
 	return ch
 }
 
+func (m *testMockEtcdClient) SetEndpoints(_ ...string) {}
+
 func (m *testMockEtcdClient) Close() error {
 	return nil
 }

@@ -308,12 +308,15 @@ func TestProjectionActor_Reset_ClearsState(t *testing.T) {
 	snap1 := waitForSnapshot(t, snapCh, 3*time.Second)
 	assert.Contains(t, allNodes(snap1), "/svc/by_id/1")
 
-	// EventWatchSnapshotLoading clears topology internally but does NOT publish.
-	// Follow up with EventWatchSnapshotLoaded (empty nodes) to get a snapshot.
+	// EventWatchSnapshotLoading clears discovery state and publishes a not-ready snapshot.
+	// Drain it, then follow up with EventWatchSnapshotLoaded (empty nodes) to get the ready snapshot.
 	bus.Publish(runtime.EventEnvelope{
 		Type:    runtime.EventWatchSnapshotLoading,
 		Version: 1,
 	})
+	snapLoading := waitForSnapshot(t, snapCh, 3*time.Second)
+	assert.False(t, snapLoading.Discovery.Ready, "Loading snapshot must have Ready=false")
+
 	bus.Publish(runtime.EventEnvelope{
 		Type:    runtime.EventWatchSnapshotLoaded,
 		Version: 1,
@@ -402,4 +405,135 @@ func waitForSnapshotWithin(t *testing.T, ch <-chan *snapshot.ExportSnapshot, wai
 	case <-time.After(time.Duration(waitMs) * time.Millisecond):
 		return nil
 	}
+}
+
+// TestProjectionActor_MultiPrefix_MergesNodes verifies that nodes from two
+// independent discovery watch prefixes (/by_id and /by_name) are merged into
+// a single NodesByPath map, and that Discovery.Ready becomes true only after
+// both streams have completed loading.
+func TestProjectionActor_MultiPrefix_MergesNodes(t *testing.T) {
+	bus := runtime.NewEventBus()
+	_, snapCh, cancel := startProjectionActor(t, bus)
+	defer cancel()
+
+	// Both streams start loading simultaneously.
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoading,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadingPayload{Prefix: "/svc/by_id"},
+	})
+	snapL1 := waitForSnapshot(t, snapCh, 3*time.Second)
+	assert.False(t, snapL1.Discovery.Ready)
+
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoading,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadingPayload{Prefix: "/svc/by_name"},
+	})
+	snapL2 := waitForSnapshot(t, snapCh, 3*time.Second)
+	assert.False(t, snapL2.Discovery.Ready)
+
+	// /by_id stream finishes loading first.
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoaded,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadedPayload{
+			Prefix:   "/svc/by_id",
+			Nodes:    map[string]*snapshot.DiscoveryNode{"/svc/by_id/1": {Path: "/svc/by_id/1", Info: &pb.AtappDiscovery{Id: 1}}},
+			Revision: 10,
+		},
+	})
+	snapByID := waitForSnapshot(t, snapCh, 3*time.Second)
+	assert.False(t, snapByID.Discovery.Ready, "still waiting for /by_name prefix")
+	assert.Contains(t, allNodes(snapByID), "/svc/by_id/1", "by_id nodes must be present")
+
+	// /by_name stream finishes loading second.
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoaded,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadedPayload{
+			Prefix:   "/svc/by_name",
+			Nodes:    map[string]*snapshot.DiscoveryNode{"/svc/by_name/svc-a": {Path: "/svc/by_name/svc-a", Info: &pb.AtappDiscovery{Id: 1}}},
+			Revision: 10,
+		},
+	})
+	snapFinal := waitForSnapshot(t, snapCh, 3*time.Second)
+
+	assert.True(t, snapFinal.Discovery.Ready, "all prefixes loaded — must be Ready")
+	assert.Contains(t, allNodes(snapFinal), "/svc/by_id/1", "by_id nodes survive after by_name load")
+	assert.Contains(t, allNodes(snapFinal), "/svc/by_name/svc-a", "by_name nodes are present")
+	assert.Len(t, allNodes(snapFinal), 2, "total 2 entries from both prefixes")
+}
+
+// TestProjectionActor_MultiPrefix_StreamRestart_OnlyEvictsOwnNodes verifies
+// that when one stream restarts (SnapshotLoading), nodes from the other
+// stream are NOT evicted.
+func TestProjectionActor_MultiPrefix_StreamRestart_OnlyEvictsOwnNodes(t *testing.T) {
+	bus := runtime.NewEventBus()
+	_, snapCh, cancel := startProjectionActor(t, bus)
+	defer cancel()
+
+	// Both prefixes fully loaded.
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoading,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadingPayload{Prefix: "/svc/by_id"},
+	})
+	waitForSnapshot(t, snapCh, 3*time.Second)
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoaded,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadedPayload{
+			Prefix:   "/svc/by_id",
+			Nodes:    map[string]*snapshot.DiscoveryNode{"/svc/by_id/1": {Path: "/svc/by_id/1", Info: &pb.AtappDiscovery{Id: 1}}},
+			Revision: 5,
+		},
+	})
+	waitForSnapshot(t, snapCh, 3*time.Second)
+
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoading,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadingPayload{Prefix: "/svc/by_name"},
+	})
+	waitForSnapshot(t, snapCh, 3*time.Second)
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoaded,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadedPayload{
+			Prefix:   "/svc/by_name",
+			Nodes:    map[string]*snapshot.DiscoveryNode{"/svc/by_name/svc-a": {Path: "/svc/by_name/svc-a", Info: &pb.AtappDiscovery{Id: 1}}},
+			Revision: 5,
+		},
+	})
+	snapFull := waitForSnapshot(t, snapCh, 3*time.Second)
+	require.True(t, snapFull.Discovery.Ready)
+	require.Len(t, allNodes(snapFull), 2)
+
+	// /by_id stream restarts — only /by_id nodes are evicted.
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoading,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadingPayload{Prefix: "/svc/by_id"},
+	})
+	snapReloading := waitForSnapshot(t, snapCh, 3*time.Second)
+	assert.False(t, snapReloading.Discovery.Ready, "must be not-ready while /by_id reloads")
+	assert.NotContains(t, allNodes(snapReloading), "/svc/by_id/1", "stale /by_id node must be evicted")
+	assert.Contains(t, allNodes(snapReloading), "/svc/by_name/svc-a", "/by_name nodes must survive")
+
+	// /by_id finishes reloading with an updated node.
+	bus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventWatchSnapshotLoaded,
+		Version: 1,
+		Payload: orchestrator.WatchSnapshotLoadedPayload{
+			Prefix:   "/svc/by_id",
+			Nodes:    map[string]*snapshot.DiscoveryNode{"/svc/by_id/2": {Path: "/svc/by_id/2", Info: &pb.AtappDiscovery{Id: 2}}},
+			Revision: 10,
+		},
+	})
+	snapAfter := waitForSnapshot(t, snapCh, 3*time.Second)
+	assert.True(t, snapAfter.Discovery.Ready)
+	assert.NotContains(t, allNodes(snapAfter), "/svc/by_id/1", "old /by_id node must be gone")
+	assert.Contains(t, allNodes(snapAfter), "/svc/by_id/2", "new /by_id node must appear")
+	assert.Contains(t, allNodes(snapAfter), "/svc/by_name/svc-a", "/by_name nodes untouched")
 }

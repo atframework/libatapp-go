@@ -2,10 +2,10 @@ package libatapp
 
 import (
 	"context"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	modulev2 "github.com/atframework/libatapp-go/etcd_module_v2"
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
@@ -19,8 +19,8 @@ var _ EtcdAppModuleImpl = (*etcdModuleAdapter)(nil)
 type etcdModuleAdapter struct {
 	AppModuleBase
 
-	mu         sync.RWMutex
-	impl       *modulev2.EtcdModule
+	mu   sync.RWMutex
+	impl *modulev2.EtcdModule
 
 	// config state (new v2 does not expose these)
 	etcdCfg    *pb.AtappEtcd
@@ -46,14 +46,14 @@ type etcdModuleAdapter struct {
 	byNameWatcherCbs []DiscoveryWatcherListCallback
 	topoWatcherCbs   []TopologyWatcherListCallback
 
-	// snapshot readiness
-	discoverySnapshotReady bool
-	topologySnapshotReady  bool
-	topologyInfoSet        map[uint64]*TopologyStorage
-	discoveryNodeSet       map[string]*DiscoveryNodeStorage
+	// prevSnap is the last snapshot seen by onSnapshotPublished; used for diff.
+	// Written only on ProjectionActor's goroutine (via OnSnapshotPublished hook).
+	prevSnap atomic.Pointer[modulev2.ExportSnapshot]
 
-	// EventBus subscription handle (unsubscribed on Reset/Cleanup)
-	busSubHandle modulev2.EventHandle
+	// registrations caches every ServiceInfo submitted via AddRegistration* so
+	// that they can be replayed after a hard reload (new impl, new actor state).
+	// Protected by mu.
+	registrations map[string]modulev2.ServiceInfo
 }
 
 func newEtcdModuleAdapter(owner AppImpl) *etcdModuleAdapter {
@@ -65,8 +65,7 @@ func newEtcdModuleAdapter(owner AppImpl) *etcdModuleAdapter {
 		discSnapLoadedCbs: make(map[EventCallbackHandle]DiscoverySnapshotEventCallback),
 		topoSnapLoadCbs:   make(map[EventCallbackHandle]TopologySnapshotEventCallback),
 		topoSnapLoadedCbs: make(map[EventCallbackHandle]TopologySnapshotEventCallback),
-		topologyInfoSet:   make(map[uint64]*TopologyStorage),
-		discoveryNodeSet:  make(map[string]*DiscoveryNodeStorage),
+		registrations:     make(map[string]modulev2.ServiceInfo),
 	}
 	return a
 }
@@ -97,27 +96,19 @@ func (m *etcdModuleAdapter) ensureImpl() error {
 		return nil
 	}
 
+	// Always persist the config for GetConfigure() / GetConfigurePath() queries,
+	// even when the module is disabled.
 	m.etcdCfg = etcdCfg
 	m.enabled = etcdCfg.GetEnable()
 
-	basePath := etcdCfg.GetPath()
-	leaseTTL := int64(10)
-	if kp := etcdCfg.GetKeepalive(); kp != nil {
-		if ttl := kp.GetTtl(); ttl != nil {
-			if secs := int64(ttl.AsDuration().Seconds()); secs > 0 {
-				leaseTTL = secs
-			}
-		}
-	}
-	m.pathCfg = modulev2.PathConfig{
-		ByNamePrefix:   basePath + "/by_name",
-		ByIDPrefix:     basePath + "/by_id",
-		TopologyPrefix: basePath + "/topology",
-		WatchPrefixes:  []string{basePath + "/by_id", basePath + "/by_name", basePath + "/topology"},
-		LeaseTTL:       leaseTTL,
+	if !m.enabled {
+		// Module is administratively disabled; do not create the impl.
+		return nil
 	}
 
-	opts := modulev2.ModuleOptions{}
+	opts := modulev2.ModuleOptions{
+		OnSnapshotPublished: m.onSnapshotPublished,
+	}
 	if cl := etcdCfg.GetCluster(); cl != nil {
 		if ri := cl.GetRetryInterval(); ri != nil {
 			opts.RetryInterval = ri.AsDuration()
@@ -136,17 +127,14 @@ func (m *etcdModuleAdapter) ensureImpl() error {
 		return err
 	}
 	m.impl = etcdModule
+	// Derive pathCfg from the module itself to guarantee single source of truth.
+	m.pathCfg = etcdModule.GetPathConfig()
 	return nil
 }
 
 // ── AppModuleImpl ─────────────────────────────────────────────────────────
 
 func (m *etcdModuleAdapter) Name() string { return "etcd_module" }
-
-func (m *etcdModuleAdapter) Setup(parent context.Context) error {
-	_ = parent
-	return m.ensureImpl()
-}
 
 func (m *etcdModuleAdapter) Init(parent context.Context) error {
 	if err := m.ensureImpl(); err != nil {
@@ -158,20 +146,119 @@ func (m *etcdModuleAdapter) Init(parent context.Context) error {
 	if impl == nil {
 		return nil
 	}
-	if err := impl.Start(parent); err != nil {
+	return m.startImpl(parent, impl)
+}
+
+// startImpl starts impl and replays all pending registrations from the cache.
+// Must be called with m.mu NOT held.
+func (m *etcdModuleAdapter) startImpl(ctx context.Context, impl *modulev2.EtcdModule) error {
+	if err := impl.Start(ctx); err != nil {
 		return err
 	}
-	// Subscribe to the EventBus after Start (bus is initialised inside Start).
-	handle := impl.Subscribe(m.handleBusEvent)
-	m.mu.Lock()
-	m.busSubHandle = handle
-	m.mu.Unlock()
+	m.replayRegistrations(ctx, impl)
 	return nil
 }
 
+// replayRegistrations re-submits every cached ServiceInfo to impl.
+// Call after impl.Start to restore registrations lost when the actor restarts.
+// Must be called with m.mu NOT held.
+func (m *etcdModuleAdapter) replayRegistrations(ctx context.Context, impl *modulev2.EtcdModule) {
+	m.mu.RLock()
+	if len(m.registrations) == 0 {
+		m.mu.RUnlock()
+		return
+	}
+	svcs := make([]modulev2.ServiceInfo, 0, len(m.registrations))
+	for _, svc := range m.registrations {
+		svcs = append(svcs, svc)
+	}
+	m.mu.RUnlock()
+	for _, svc := range svcs {
+		_, _ = impl.RegisterService(ctx, svc)
+	}
+}
+
 func (m *etcdModuleAdapter) Reload() error {
-	// v2 does not have an explicit Reload; config changes require a Stop/Start cycle.
+	// Classify the change: does it require Stop+Start (hard) or just endpoint
+	// update (soft)?  Soft is preferred because it preserves the lease and
+	// keeps watch streams live.
+	owner := m.GetApp()
+	var newEtcdCfg *pb.AtappEtcd
+	if owner != nil {
+		if cfg := owner.GetConfig(); cfg != nil && cfg.ConfigPb != nil {
+			newEtcdCfg = cfg.ConfigPb.GetEtcd()
+		}
+	}
+
+	m.mu.RLock()
+	oldEtcdCfg := m.etcdCfg
+	impl := m.impl
+	m.mu.RUnlock()
+
+	if etcdHardReloadRequired(oldEtcdCfg, newEtcdCfg) {
+		return m.hardReload()
+	}
+
+	// ── Soft path ────────────────────────────────────────────────────────
+	// TLS, auth, base path and the enable flag are unchanged.
+	// Only hosts list (and/or timing params) may differ.
+	m.mu.Lock()
+	m.etcdCfg = newEtcdCfg
+	m.mu.Unlock()
+
+	if impl == nil {
+		return nil
+	}
+	if newHosts := newEtcdCfg.GetHosts(); len(newHosts) > 0 {
+		_ = impl.UpdateEndpoints(newHosts)
+	}
 	return nil
+}
+
+// hardReload tears down the running impl and all cached state, then re-creates
+// it from the current app config.  Use when TLS, auth, base path, or the
+// enable flag changes — scenarios that cannot be hot-swapped on a live client.
+func (m *etcdModuleAdapter) hardReload() error {
+	m.mu.Lock()
+	impl := m.impl
+	oldPathCfg := m.pathCfg
+	m.impl = nil
+	m.etcdCfg = nil
+	m.pathCfg = modulev2.PathConfig{}
+	m.mu.Unlock()
+
+	m.prevSnap.Store(nil)
+
+	if impl != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = impl.Stop(stopCtx)
+	}
+
+	// Re-create from current config (no-op when there is no owner or the
+	// module is disabled in the new config).
+	if err := m.ensureImpl(); err != nil {
+		return err
+	}
+
+	// If the path prefixes changed the cached ServiceInfo.Path values are
+	// stale (they embed the old prefix).  Clear them so that replayRegistrations
+	// does not write ghost keys under the new lease; the application layer will
+	// re-register with paths built from the new prefix.
+	m.mu.Lock()
+	newPathCfg := m.pathCfg
+	newImpl := m.impl
+	if oldPathCfg.ByIDPrefix != newPathCfg.ByIDPrefix ||
+		oldPathCfg.ByNamePrefix != newPathCfg.ByNamePrefix ||
+		oldPathCfg.TopologyPrefix != newPathCfg.TopologyPrefix {
+		m.registrations = make(map[string]modulev2.ServiceInfo)
+	}
+	m.mu.Unlock()
+
+	if newImpl == nil {
+		return nil
+	}
+	return m.startImpl(context.Background(), newImpl)
 }
 
 func (m *etcdModuleAdapter) Stop() (bool, error) {
@@ -195,8 +282,6 @@ func (m *etcdModuleAdapter) Cleanup() {
 	}
 }
 
-func (m *etcdModuleAdapter) Timeout() {}
-
 func (m *etcdModuleAdapter) Tick(_ context.Context) bool {
 	m.mu.RLock()
 	impl := m.impl
@@ -211,19 +296,14 @@ func (m *etcdModuleAdapter) Tick(_ context.Context) bool {
 func (m *etcdModuleAdapter) Reset() {
 	m.mu.Lock()
 	impl := m.impl
-	handle := m.busSubHandle
 	m.impl = nil
-	m.busSubHandle = 0
-	m.discoverySnapshotReady = false
-	m.topologySnapshotReady = false
-	m.topologyInfoSet = make(map[uint64]*TopologyStorage)
-	m.discoveryNodeSet = make(map[string]*DiscoveryNodeStorage)
+	m.etcdCfg = nil
+	m.pathCfg = modulev2.PathConfig{}
 	m.mu.Unlock()
 
+	m.prevSnap.Store(nil)
+
 	if impl != nil {
-		if handle != 0 {
-			impl.Unsubscribe(handle)
-		}
 		_ = impl.Stop(context.Background())
 	}
 }
@@ -362,19 +442,19 @@ func (m *etcdModuleAdapter) AddRegistrationDiscoveryActor(val *pb.AtappDiscovery
 	if val == nil {
 		return nil
 	}
-	m.mu.RLock()
+	svc := modulev2.ServiceInfo{Discovery: val, Path: nodePath}
+
+	m.mu.Lock()
+	m.registrations[nodePath] = svc
 	impl := m.impl
-	m.mu.RUnlock()
+	m.mu.Unlock()
+
 	if impl == nil {
 		return nil
 	}
-
-	svc := modulev2.ServiceInfo{Discovery: val, Path: nodePath}
 	if _, err := impl.RegisterService(context.Background(), svc); err != nil {
 		return nil
 	}
-
-	// Return a path token for legacy remove flow.
 	return &EtcdRegistration{path: nodePath}
 }
 
@@ -382,19 +462,19 @@ func (m *etcdModuleAdapter) AddRegistrationTopologyActor(val *pb.AtappTopologyIn
 	if val == nil {
 		return nil
 	}
-	m.mu.RLock()
+	svc := modulev2.ServiceInfo{TopologyInfo: val, Path: nodePath}
+
+	m.mu.Lock()
+	m.registrations[nodePath] = svc
 	impl := m.impl
-	m.mu.RUnlock()
+	m.mu.Unlock()
+
 	if impl == nil {
 		return nil
 	}
-
-	svc := modulev2.ServiceInfo{TopologyInfo: val, Path: nodePath}
 	if _, err := impl.RegisterService(context.Background(), svc); err != nil {
 		return nil
 	}
-
-	// Return a path token compatible with legacy remove flow.
 	return &EtcdRegistration{path: nodePath}
 }
 
@@ -406,9 +486,12 @@ func (m *etcdModuleAdapter) RemoveRegistrationActor(reg *EtcdRegistration) bool 
 	if path == "" {
 		return false
 	}
-	m.mu.RLock()
+
+	m.mu.Lock()
+	delete(m.registrations, path)
 	impl := m.impl
-	m.mu.RUnlock()
+	m.mu.Unlock()
+
 	if impl == nil {
 		return false
 	}
@@ -463,33 +546,61 @@ func (m *etcdModuleAdapter) GetGlobalDiscovery() *EtcdDiscoverySet { return nil 
 
 // ── EtcdModuleImpl — topology info set ───────────────────────────────────
 
-// GetTopologyInfoSet returns a shallow copy of the in-memory topology cache.
+// GetTopologyInfoSet returns a shallow copy of the topology cache from the latest snapshot.
 func (m *etcdModuleAdapter) GetTopologyInfoSet() map[uint64]*TopologyStorage {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make(map[uint64]*TopologyStorage, len(m.topologyInfoSet))
-	for key, value := range m.topologyInfoSet {
-		if value == nil {
+	impl := m.impl
+	m.mu.RUnlock()
+	if impl == nil {
+		return make(map[uint64]*TopologyStorage)
+	}
+	snap := impl.GetSnapshot()
+	if snap == nil {
+		return make(map[uint64]*TopologyStorage)
+	}
+	out := make(map[uint64]*TopologyStorage, len(snap.Topology.NodesByID))
+	for id, node := range snap.Topology.NodesByID {
+		if node == nil || node.Info == nil {
 			continue
 		}
-		copied := *value
-		out[key] = &copied
+		out[id] = &TopologyStorage{
+			Info: node.Info,
+			Version: EtcdDataVersion{
+				CreateRevision: node.CreateRevision,
+				ModRevision:    node.ModRevision,
+				Version:        node.Version,
+			},
+		}
 	}
 	return out
 }
 
-// GetDiscoveryNodeSet returns a shallow copy of the in-memory discovery node cache,
+// GetDiscoveryNodeSet returns a shallow copy of the discovery node cache from the latest snapshot,
 // keyed by etcd path.
 func (m *etcdModuleAdapter) GetDiscoveryNodeSet() map[string]*DiscoveryNodeStorage {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make(map[string]*DiscoveryNodeStorage, len(m.discoveryNodeSet))
-	for key, value := range m.discoveryNodeSet {
-		if value == nil {
+	impl := m.impl
+	m.mu.RUnlock()
+	if impl == nil {
+		return make(map[string]*DiscoveryNodeStorage)
+	}
+	snap := impl.GetSnapshot()
+	if snap == nil {
+		return make(map[string]*DiscoveryNodeStorage)
+	}
+	out := make(map[string]*DiscoveryNodeStorage, len(snap.Discovery.NodesByPath))
+	for path, node := range snap.Discovery.NodesByPath {
+		if node == nil || node.Info == nil {
 			continue
 		}
-		copied := *value
-		out[key] = &copied
+		out[path] = &DiscoveryNodeStorage{
+			Info: node.Info,
+			Version: EtcdDataVersion{
+				CreateRevision: node.CreateRevision,
+				ModRevision:    node.ModRevision,
+				Version:        node.Version,
+			},
+		}
 	}
 	return out
 }
@@ -498,8 +609,13 @@ func (m *etcdModuleAdapter) GetDiscoveryNodeSet() map[string]*DiscoveryNodeStora
 
 func (m *etcdModuleAdapter) HasDiscoverySnapshot() bool {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.discoverySnapshotReady
+	impl := m.impl
+	m.mu.RUnlock()
+	if impl == nil {
+		return false
+	}
+	snap := impl.GetSnapshot()
+	return snap != nil && snap.Discovery.Ready
 }
 
 func (m *etcdModuleAdapter) AddOnLoadDiscoverySnapshot(fn DiscoverySnapshotEventCallback) EventCallbackHandle {
@@ -540,8 +656,13 @@ func (m *etcdModuleAdapter) RemoveOnDiscoverySnapshotLoaded(handle EventCallback
 
 func (m *etcdModuleAdapter) HasTopologySnapshot() bool {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.topologySnapshotReady
+	impl := m.impl
+	m.mu.RUnlock()
+	if impl == nil {
+		return false
+	}
+	snap := impl.GetSnapshot()
+	return snap != nil && snap.Topology.Ready
 }
 
 func (m *etcdModuleAdapter) AddOnLoadTopologySnapshot(fn TopologySnapshotEventCallback) EventCallbackHandle {
@@ -578,137 +699,145 @@ func (m *etcdModuleAdapter) RemoveOnTopologySnapshotLoaded(handle EventCallbackH
 	m.cbMu.Unlock()
 }
 
-// ── EventBus handler ──────────────────────────────────────────────────────
+// ── Snapshot diff handler ─────────────────────────────────────────────────
 
-// handleBusEvent is called on the publishing actor's goroutine; must be fast.
-func (m *etcdModuleAdapter) handleBusEvent(env modulev2.EventEnvelope) {
-	switch env.Type {
-	case modulev2.EventWatchNodeUp, modulev2.EventWatchNodeUpdate:
-		m.dispatchNodeEvent(EtcdDiscoveryActionPut, env)
-	case modulev2.EventWatchNodeDown:
-		m.dispatchNodeEvent(EtcdDiscoveryActionDelete, env)
-	case modulev2.EventWatchTopologyUp, modulev2.EventWatchTopologyUpdate:
-		m.dispatchTopologyEvent(EtcdWatchEventPut, env)
-	case modulev2.EventWatchTopologyDown:
-		m.dispatchTopologyEvent(EtcdWatchEventDelete, env)
-	case modulev2.EventWatchSnapshotLoading:
-		m.mu.Lock()
-		m.discoverySnapshotReady = false
-		m.discoveryNodeSet = make(map[string]*DiscoveryNodeStorage)
-		m.mu.Unlock()
+// onSnapshotPublished is called by ProjectionActor after each atomic snapshot
+// store.  Runs on ProjectionActor's goroutine; must be fast and non-blocking.
+func (m *etcdModuleAdapter) onSnapshotPublished(snap *modulev2.ExportSnapshot) {
+	prev := m.prevSnap.Swap(snap)
+	if snap == nil {
+		return
+	}
+
+	switch snap.Cause {
+	case modulev2.SnapshotCauseDiscovery:
+		m.diffDiscovery(prev, snap)
+	case modulev2.SnapshotCauseTopology:
+		m.diffTopology(prev, snap)
+	case modulev2.SnapshotCauseRegistration:
+		// Registration changes carry no node-level events for adapter consumers.
+	default: // SnapshotCauseReset or unknown
+		m.diffDiscovery(prev, snap)
+		m.diffTopology(prev, snap)
+	}
+}
+
+// diffDiscovery diffs the Discovery sub-tree and fires appropriate callbacks.
+func (m *etcdModuleAdapter) diffDiscovery(prev, snap *modulev2.ExportSnapshot) {
+	prevDiscReady := prev != nil && prev.Discovery.Ready
+	newDiscReady := snap.Discovery.Ready
+
+	// ready → not ready
+	if prevDiscReady && !newDiscReady {
 		m.fireDiscSnapLoadCbs()
-	case modulev2.EventWatchSnapshotLoaded:
-		payload, _ := toWatchSnapshotLoadedPayload(env.Payload)
-		discoveryNodeSet := make(map[string]*DiscoveryNodeStorage)
-		if payload != nil {
-			for _, node := range payload.Nodes {
-				if node == nil || node.Info == nil || node.Path == "" {
-					continue
-				}
-				discoveryNodeSet[node.Path] = &DiscoveryNodeStorage{
-					Info: node.Info,
-					Version: EtcdDataVersion{
-						CreateRevision: node.CreateRevision,
-						ModRevision:    node.ModRevision,
-						Version:        node.Version,
-					},
+	}
+
+	// NodesByPath diff
+	for path, newNode := range snap.Discovery.NodesByPath {
+		if newNode == nil || newNode.Info == nil {
+			continue
+		}
+		if prev != nil {
+			if oldNode, exists := prev.Discovery.NodesByPath[path]; exists && oldNode != nil {
+				if atappDiscoveryEqual(oldNode.Info, newNode.Info) {
+					continue // content unchanged – suppress redundant callback
 				}
 			}
 		}
-		m.mu.Lock()
-		m.discoverySnapshotReady = true
-		m.discoveryNodeSet = discoveryNodeSet
-		m.mu.Unlock()
+		m.fireNodeCallbacks(EtcdDiscoveryActionPut, newNode)
+	}
+	if prev != nil {
+		for path, oldNode := range prev.Discovery.NodesByPath {
+			if oldNode == nil {
+				continue
+			}
+			if _, exists := snap.Discovery.NodesByPath[path]; !exists {
+				m.fireNodeCallbacks(EtcdDiscoveryActionDelete, oldNode)
+			}
+		}
+	}
+
+	// not ready → ready
+	if !prevDiscReady && newDiscReady {
 		m.fireDiscSnapLoadedCbs()
-	case modulev2.EventWatchTopologySnapshotLoading:
-		m.mu.Lock()
-		m.topologySnapshotReady = false
-		m.topologyInfoSet = make(map[uint64]*TopologyStorage)
-		m.mu.Unlock()
+	}
+}
+
+// diffTopology diffs the Topology sub-tree and fires appropriate callbacks.
+func (m *etcdModuleAdapter) diffTopology(prev, snap *modulev2.ExportSnapshot) {
+	prevTopoReady := prev != nil && prev.Topology.Ready
+	newTopoReady := snap.Topology.Ready
+
+	// ready → not ready
+	if prevTopoReady && !newTopoReady {
 		m.fireTopologySnapLoadCbs()
-	case modulev2.EventWatchTopologySnapshotLoaded:
-		payload, _ := toWatchTopologySnapshotLoadedPayload(env.Payload)
-		topologyInfoSet := make(map[uint64]*TopologyStorage)
-		if payload != nil {
-			for id, node := range payload.Nodes {
-				if node == nil || node.Info == nil || id == 0 {
-					continue
-				}
-				topologyInfoSet[id] = &TopologyStorage{
-					Info: node.Info,
-					Version: EtcdDataVersion{
-						CreateRevision: node.CreateRevision,
-						ModRevision:    node.ModRevision,
-						Version:        node.Version,
-					},
+	}
+
+	// NodesByID diff
+	for id, newNode := range snap.Topology.NodesByID {
+		if newNode == nil || newNode.Info == nil || id == 0 {
+			continue
+		}
+		if prev != nil {
+			if oldNode, exists := prev.Topology.NodesByID[id]; exists && oldNode != nil {
+				if atappTopologyEqual(oldNode.Info, newNode.Info) {
+					continue // content unchanged – suppress redundant callback
 				}
 			}
 		}
-		m.mu.Lock()
-		m.topologySnapshotReady = true
-		m.topologyInfoSet = topologyInfoSet
-		m.mu.Unlock()
+		m.fireTopologyCallbacks(EtcdWatchEventPut, newNode)
+	}
+	if prev != nil {
+		for id, oldNode := range prev.Topology.NodesByID {
+			if oldNode == nil || id == 0 {
+				continue
+			}
+			if _, exists := snap.Topology.NodesByID[id]; !exists {
+				m.fireTopologyCallbacks(EtcdWatchEventDelete, oldNode)
+			}
+		}
+	}
+
+	// not ready → ready
+	if !prevTopoReady && newTopoReady {
 		m.fireTopologySnapLoadedCbs()
 	}
 }
 
-func (m *etcdModuleAdapter) dispatchNodeEvent(action EtcdDiscoveryAction, env modulev2.EventEnvelope) {
-	payload, ok := toWatchNodePayload(env.Payload)
-	if !ok || payload == nil || (action == EtcdDiscoveryActionPut && payload.Value == nil) {
-		return
-	}
+// fireNodeCallbacks fires discovery-node callbacks for a single node change.
+// byIDWatcherCbs is only fired for nodes whose path starts with ByIDPrefix;
+// byNameWatcherCbs is only fired for nodes whose path starts with ByNamePrefix.
+// When the path prefixes are not configured (empty strings), both groups are
+// fired to preserve backward-compatible behaviour.
+func (m *etcdModuleAdapter) fireNodeCallbacks(action EtcdDiscoveryAction, node *modulev2.DiscoveryNode) {
+	nodeInfo := &NodeInfo{NodeDiscovery: node.Info, Action: action}
 
-	// Maintain discoveryNodeSet cache before invoking callbacks.
-	// For PUT events, capture the previous entry so we can skip callbacks
-	// when the discovery content has not actually changed (etcd Version incremented
-	// but proto fields are identical).
-	var oldDiscovery *pb.AtappDiscovery
-	if action == EtcdDiscoveryActionPut && payload.Value != nil {
-		storage := &DiscoveryNodeStorage{
-			Info: payload.Value,
-			Version: EtcdDataVersion{
-				CreateRevision: payload.CreateRevision,
-				ModRevision:    payload.ModRevision,
-				Version:        payload.Version,
-			},
-		}
-		m.mu.Lock()
-		if prev := m.discoveryNodeSet[payload.Key]; prev != nil {
-			oldDiscovery = prev.Info
-		}
-		m.discoveryNodeSet[payload.Key] = storage
-		m.mu.Unlock()
+	// Determine which watcher group owns this node.
+	m.mu.RLock()
+	byIDPrefix := m.pathCfg.ByIDPrefix
+	byNamePrefix := m.pathCfg.ByNamePrefix
+	m.mu.RUnlock()
 
-		// Content unchanged — update cache but suppress redundant callbacks.
-		if oldDiscovery != nil && atappDiscoveryEqual(oldDiscovery, payload.Value) {
-			return
-		}
-	} else if action == EtcdDiscoveryActionDelete && payload.Key != "" {
-		m.mu.Lock()
-		delete(m.discoveryNodeSet, payload.Key)
-		m.mu.Unlock()
-	}
+	isById := byIDPrefix != "" && strings.HasPrefix(node.Path, byIDPrefix)
+	isByName := byNamePrefix != "" && strings.HasPrefix(node.Path, byNamePrefix)
+	// When prefixes are unconfigured, fall back to firing both groups.
+	fireAll := !isById && !isByName
 
-	// Build the node payload expected by legacy callback signature.
-	node := &modulev2.DiscoveryNode{}
-	node.Info = payload.Value
-	node.Path = payload.Key
-	node.CreateRevision = payload.CreateRevision
-	node.ModRevision = payload.ModRevision
-	node.Version = payload.Version
-
-	nodeInfo := &NodeInfo{NodeDiscovery: payload.Value, Action: action}
-
-	// Snapshot callback lists under lock, then invoke outside lock.
 	m.cbMu.Lock()
 	nodeCbs := make([]NodeEventCallback, 0, len(m.nodeEventCbs))
 	for _, fn := range m.nodeEventCbs {
 		nodeCbs = append(nodeCbs, fn)
 	}
-	byIDCbs := make([]DiscoveryWatcherListCallback, len(m.byIDWatcherCbs))
-	copy(byIDCbs, m.byIDWatcherCbs)
-	byNameCbs := make([]DiscoveryWatcherListCallback, len(m.byNameWatcherCbs))
-	copy(byNameCbs, m.byNameWatcherCbs)
+	var byIDCbs []DiscoveryWatcherListCallback
+	var byNameCbs []DiscoveryWatcherListCallback
+	if isById || fireAll {
+		byIDCbs = make([]DiscoveryWatcherListCallback, len(m.byIDWatcherCbs))
+		copy(byIDCbs, m.byIDWatcherCbs)
+	}
+	if isByName || fireAll {
+		byNameCbs = make([]DiscoveryWatcherListCallback, len(m.byNameWatcherCbs))
+		copy(byNameCbs, m.byNameWatcherCbs)
+	}
 	m.cbMu.Unlock()
 
 	sender := &DiscoveryWatcherSender{Module: m, Node: nodeInfo}
@@ -723,59 +852,23 @@ func (m *etcdModuleAdapter) dispatchNodeEvent(action EtcdDiscoveryAction, env mo
 	}
 }
 
-func (m *etcdModuleAdapter) dispatchTopologyEvent(eventType EtcdWatchEvent, env modulev2.EventEnvelope) {
-	payload, ok := toWatchTopologyPayload(env.Payload)
-	if !ok || payload == nil {
-		return
-	}
-
-	if payload.Value != nil {
-		storage := &TopologyStorage{
-			Info: payload.Value,
-			Version: EtcdDataVersion{
-				CreateRevision: payload.CreateRevision,
-				ModRevision:    payload.ModRevision,
-				Version:        payload.Version,
-			},
-		}
-		m.mu.Lock()
-		var oldTopology *pb.AtappTopologyInfo
-		if prev := m.topologyInfoSet[payload.Value.GetId()]; prev != nil {
-			oldTopology = prev.Info
-		}
-		m.topologyInfoSet[payload.Value.GetId()] = storage
-		m.mu.Unlock()
-
-		// Content unchanged — update cache but suppress redundant callbacks.
-		if oldTopology != nil && atappTopologyEqual(oldTopology, payload.Value) {
-			return
-		}
-	} else if eventType == EtcdWatchEventDelete {
-		id := parseTopologyIDFromPath(payload.Key)
-		if id != 0 {
-			m.mu.Lock()
-			delete(m.topologyInfoSet, id)
-			m.mu.Unlock()
-		}
-	}
-
+// fireTopologyCallbacks fires all topology callbacks for a single node change.
+func (m *etcdModuleAdapter) fireTopologyCallbacks(eventType EtcdWatchEvent, node *modulev2.TopologyNode) {
 	var topologyStorage *TopologyStorage
-	if payload.Value != nil {
+	if node.Info != nil {
 		topologyStorage = &TopologyStorage{
-			Info: payload.Value,
+			Info: node.Info,
 			Version: EtcdDataVersion{
-				CreateRevision: payload.CreateRevision,
-				ModRevision:    payload.ModRevision,
-				Version:        payload.Version,
+				CreateRevision: node.CreateRevision,
+				ModRevision:    node.ModRevision,
+				Version:        node.Version,
 			},
 		}
 	}
-
-	sender := &TopologyWatcherSender{Module: m, Topology: topologyStorage, Action: eventType}
 	version := &EtcdDataVersion{
-		CreateRevision: payload.CreateRevision,
-		ModRevision:    payload.ModRevision,
-		Version:        payload.Version,
+		CreateRevision: node.CreateRevision,
+		ModRevision:    node.ModRevision,
+		Version:        node.Version,
 	}
 
 	m.cbMu.Lock()
@@ -787,80 +880,13 @@ func (m *etcdModuleAdapter) dispatchTopologyEvent(eventType EtcdWatchEvent, env 
 	copy(topologyWatcherCallbacks, m.topoWatcherCbs)
 	m.cbMu.Unlock()
 
+	sender := &TopologyWatcherSender{Module: m, Topology: topologyStorage, Action: eventType}
 	for _, fn := range topologyInfoCallbacks {
-		fn(eventType, payload.Value, version)
+		fn(eventType, node.Info, version)
 	}
 	for _, fn := range topologyWatcherCallbacks {
 		fn(sender)
 	}
-}
-
-func toWatchNodePayload(payload any) (*modulev2.WatchNodePayload, bool) {
-	switch value := payload.(type) {
-	case modulev2.WatchNodePayload:
-		copyValue := value
-		return &copyValue, true
-	case *modulev2.WatchNodePayload:
-		return value, value != nil
-	default:
-		return nil, false
-	}
-}
-
-func toWatchTopologyPayload(payload any) (*modulev2.WatchTopologyPayload, bool) {
-	switch value := payload.(type) {
-	case modulev2.WatchTopologyPayload:
-		copyValue := value
-		return &copyValue, true
-	case *modulev2.WatchTopologyPayload:
-		return value, value != nil
-	default:
-		return nil, false
-	}
-}
-
-func toWatchTopologySnapshotLoadedPayload(payload any) (*modulev2.WatchTopologySnapshotLoadedPayload, bool) {
-	switch value := payload.(type) {
-	case modulev2.WatchTopologySnapshotLoadedPayload:
-		copyValue := value
-		return &copyValue, true
-	case *modulev2.WatchTopologySnapshotLoadedPayload:
-		return value, value != nil
-	default:
-		return nil, false
-	}
-}
-
-func toWatchSnapshotLoadedPayload(payload any) (*modulev2.WatchSnapshotLoadedPayload, bool) {
-	switch value := payload.(type) {
-	case modulev2.WatchSnapshotLoadedPayload:
-		copyValue := value
-		return &copyValue, true
-	case *modulev2.WatchSnapshotLoadedPayload:
-		return value, value != nil
-	default:
-		return nil, false
-	}
-}
-
-func parseTopologyIDFromPath(path string) uint64 {
-	if path == "" {
-		return 0
-	}
-	lastSlash := strings.LastIndex(path, "/")
-	nameWithID := path
-	if lastSlash >= 0 && lastSlash+1 < len(path) {
-		nameWithID = path[lastSlash+1:]
-	}
-	lastDash := strings.LastIndex(nameWithID, "-")
-	if lastDash < 0 || lastDash+1 >= len(nameWithID) {
-		return 0
-	}
-	id, err := strconv.ParseUint(nameWithID[lastDash+1:], 10, 64)
-	if err != nil {
-		return 0
-	}
-	return id
 }
 
 func (m *etcdModuleAdapter) fireDiscSnapLoadCbs() {
@@ -1008,6 +1034,65 @@ func atappDiscoveryEqual(l, r *pb.AtappDiscovery) bool {
 		}
 	}
 	return true
+}
+
+// ── Reload classification helpers ────────────────────────────────────────
+
+// etcdHardReloadRequired returns true when the configuration delta between old
+// and newCfg requires a full Stop+Start cycle rather than a soft endpoint
+// update via UpdateEndpoints.
+//
+// Hard changes are those that cannot be hot-swapped on a live clientv3 instance:
+//
+//   - either config is nil (no baseline to compare)
+//   - enable flag toggled (true→false must revoke lease, false→true needs new client)
+//   - hosts list emptied (no valid endpoint remains)
+//   - base path changed (pathCfg is baked into actor key prefixes at construction)
+//   - auth credentials changed (clientv3 has no live credential-swap support)
+//   - TLS scheme toggled (plaintext↔TLS requires a new clientv3.New call)
+//   - CA certificate file changed (new CA may not trust the old cert on reconnect)
+func etcdHardReloadRequired(old, newCfg *pb.AtappEtcd) bool {
+	if old == nil || newCfg == nil {
+		return true
+	}
+	if old.GetEnable() != newCfg.GetEnable() {
+		return true
+	}
+	if len(newCfg.GetHosts()) == 0 {
+		return true
+	}
+	if old.GetPath() != newCfg.GetPath() {
+		return true
+	}
+	if old.GetAuthorization() != newCfg.GetAuthorization() {
+		return true
+	}
+	if etcdTLSSchemeChanged(old, newCfg) {
+		return true
+	}
+	return false
+}
+
+// etcdTLSSchemeChanged returns true when the TLS configuration changes in a
+// way that requires a new clientv3 connection:
+//   - SSL presence toggled (plaintext ↔ TLS)
+//   - CA certificate path changed (a different CA may reject the peer cert on
+//     the next reconnect, so a fresh client with the new CA bundle is safer)
+func etcdTLSSchemeChanged(old, newCfg *pb.AtappEtcd) bool {
+	oldSSL := old.GetSsl()
+	newSSL := newCfg.GetSsl()
+	// "TLS is active" when there is an ssl block that configures at least one
+	// of: client cert, CA cert, or peer verification.
+	oldActive := oldSSL != nil && (oldSSL.GetSslClientCert() != "" || oldSSL.GetSslCaCert() != "" || oldSSL.GetVerifyPeer())
+	newActive := newSSL != nil && (newSSL.GetSslClientCert() != "" || newSSL.GetSslCaCert() != "" || newSSL.GetVerifyPeer())
+	if oldActive != newActive {
+		return true // plaintext ↔ TLS
+	}
+	if !oldActive {
+		return false // both plaintext
+	}
+	// Both use TLS — only a CA cert change forces a hard reload.
+	return oldSSL.GetSslCaCert() != newSSL.GetSslCaCert()
 }
 
 // atappAreaEqual reports whether two AtappArea values are logically equal.

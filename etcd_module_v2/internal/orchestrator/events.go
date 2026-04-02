@@ -50,8 +50,16 @@ type WatchNodePayload struct {
 	CreateRevision int64
 }
 
+// WatchSnapshotLoadingPayload is the Payload for EventWatchSnapshotLoading.
+type WatchSnapshotLoadingPayload struct {
+	// Prefix is the watch prefix that triggered the reload.
+	Prefix string
+}
+
 // WatchSnapshotLoadedPayload is the Payload for EventWatchSnapshotLoaded.
 type WatchSnapshotLoadedPayload struct {
+	// Prefix is the watch prefix whose initial snapshot was loaded.
+	Prefix string
 	// Nodes is the full initial snapshot indexed by etcd key.
 	Nodes map[string]*snapshot.DiscoveryNode
 	// Revision is the etcd revision at which the snapshot was taken.

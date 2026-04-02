@@ -208,6 +208,14 @@ func (m *EtcdModule) Tick() {
 	}
 }
 
+// ── PathConfig accessor ───────────────────────────────────────────────────
+
+// GetPathConfig returns the path configuration this module was created with.
+// Callers should use this to avoid independently re-deriving the same paths.
+func (m *EtcdModule) GetPathConfig() PathConfig {
+	return m.cfg
+}
+
 // ── Snapshot API ──────────────────────────────────────────────────────────
 
 // GetSnapshot returns the latest atomically-published ExportSnapshot.
@@ -343,6 +351,36 @@ func (m *EtcdModule) RemoveWatchPrefix(prefix string) error {
 		return ErrNotRunning
 	}
 	m.watchActor.RemovePrefix(prefix)
+	return nil
+}
+
+// ReloadWatchStreams cancels every active watch stream and restarts them from
+// the latest etcd revision.  Use this after a detected network partition or a
+// forced reconnect to guarantee all registered prefixes re-sync.
+func (m *EtcdModule) ReloadWatchStreams() error {
+	m.mu.Lock()
+	running := m.state == moduleStateRunning
+	m.mu.Unlock()
+	if !running {
+		return ErrNotRunning
+	}
+	m.watchActor.ActiveAll()
+	return nil
+}
+
+// UpdateEndpoints hot-replaces the etcd endpoint list on the running client
+// and restarts all active watch streams so they re-establish on the new
+// endpoints.  The existing lease is not revoked.
+// Returns ErrNotRunning if the module is not in the running state.
+func (m *EtcdModule) UpdateEndpoints(endpoints []string) error {
+	m.mu.Lock()
+	running := m.state == moduleStateRunning
+	m.mu.Unlock()
+	if !running {
+		return ErrNotRunning
+	}
+	m.client.SetEndpoints(endpoints...)
+	m.watchActor.ActiveAll()
 	return nil
 }
 

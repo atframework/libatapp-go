@@ -69,6 +69,8 @@ func (c *registrationActorTestClient) KeepAlive(ctx context.Context, id clientv3
 	return nil, nil
 }
 
+func (c *registrationActorTestClient) SetEndpoints(_ ...string) {}
+
 func (c *registrationActorTestClient) Close() error {
 	return nil
 }
