@@ -50,6 +50,11 @@ type EventEnvelope struct {
 	// compatibility.  Current value: 1.
 	Version    uint16
 	Source     EventSource
+	// Sequence is a bus-global monotonically increasing counter assigned by
+	// EventBus.Publish.  It provides a total order across all events on this
+	// bus instance and can be used for tracing and dedup without per-actor
+	// counters.  Zero value means the envelope was never published through the bus.
+	Sequence   uint64
 	LeaseEpoch uint64 // incremented on every lease rebuild
 	OccurredAt time.Time
 	TraceID    string
@@ -97,10 +102,11 @@ type handlerEntry struct {
 
 // defaultEventBus is the standard in-process EventBus implementation.
 type defaultEventBus struct {
-	mu       sync.RWMutex
-	handlers map[EventHandleHandle]handlerEntry
-	nextID   atomic.Int64
-	closed   atomic.Bool
+	mu        sync.RWMutex
+	handlers  map[EventHandleHandle]handlerEntry
+	nextID    atomic.Int64
+	globalSeq atomic.Uint64
+	closed    atomic.Bool
 }
 
 // NewEventBus creates a ready-to-use EventBus.
@@ -139,6 +145,8 @@ func (b *defaultEventBus) Publish(env EventEnvelope) {
 	if b.closed.Load() {
 		return
 	}
+	// Assign a bus-global monotonic sequence number before dispatching.
+	env.Sequence = b.globalSeq.Add(1)
 	// Snapshot the handler list under read-lock so handlers run lock-free.
 	b.mu.RLock()
 	snapshot := make([]EventHandler, 0, len(b.handlers))

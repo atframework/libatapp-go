@@ -30,6 +30,12 @@ const (
 	EventWatchTopologyUpdate          // 12
 	EventWatchTopologySnapshotLoading // 13
 	EventWatchTopologySnapshotLoaded  // 14
+
+	// Projection events (producer: ProjectionActor)
+	// EventProjectionSnapshotUpdated 在 ProjectionActor 的 mailbox goroutine 内
+	// atomic.Store 完成后发布。订阅者收到此事件时可直接调用 GetSnapshot()，
+	// 无需额外轮询。
+	EventProjectionSnapshotUpdated // 15
 )
 
 // EventTypeName returns a human-readable label for the given EventType.
@@ -66,6 +72,8 @@ func EventTypeName(t EventType) string {
 		return "watch.topology.snapshot.loading"
 	case EventWatchTopologySnapshotLoaded:
 		return "watch.topology.snapshot.loaded"
+	case EventProjectionSnapshotUpdated:
+		return "projection.snapshot.updated"
 	default:
 		return fmt.Sprintf("EventType(%d)", uint32(t))
 	}

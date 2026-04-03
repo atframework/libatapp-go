@@ -1,27 +1,27 @@
 package integration_test
 
-// Complete watch pipeline tests for incremental events (NodeUp/Down/Update,
-// TopologyUp/Down/Update) and initial snapshot pre-population.
+// TestModule_Embed_Watch 系列测试覆盖增量事件（NodeUp/Down/Update、
+// TopologyUp/Down/Update）及初始快照预填充的完整流水线。
 //
-// These tests require a real embed etcd because mockserver (used in
-// etcd_module_v2/module_watch_integration_test.go) cannot:
-//   - deliver incremental Watch events after the initial snapshot
-//   - persist KV data between Put and Get calls
-//   - provide real Watch streams for EventWatchNodeDown / NodeUpdate /
-//     EventWatchTopologyUp / Down / Update
+// 这些测试需要真实的嵌入式 etcd，因为 mockserver（用于
+// etcd_module_v2/module_watch_integration_test.go）无法：
+//   - 在初始快照之后再下发增量 Watch 事件
+//   - 在 Put 和 Get 调用之间持久化 KV 数据
+//   - 为 EventWatchNodeDown / NodeUpdate /
+//     EventWatchTopologyUp / Down / Update 提供真实 Watch 流
 //
-// Mapping to existing unit / mockserver tests:
+// 与现有单元测试 / mockserver 测试的对应关系：
 //
-//   Existing (mockserver)                          │ Embed tests here
+//   现有（mockserver）                              │ 此处嵌入式 etcd 测试
 //   ───────────────────────────────────────────────┼──────────────────────────────────────────────────
 //   TestModule_Watch_ByID_SnapshotFlow             │ TestModule_Embed_Watch_InitialSnapshot_WithNodes
 //   TestModule_Watch_Topology_SnapshotFlow         │ TestModule_Embed_Watch_InitialTopologySnapshot_WithNodes
-//   TestModule_Embed_ExternalPut_TriggersWatchNodeUp│ (already in module_embed_integration_test.go)
-//   (no equivalent)                                │ TestModule_Embed_Watch_NodeDown
-//   (no equivalent)                                │ TestModule_Embed_Watch_NodeUpdate
-//   (no equivalent)                                │ TestModule_Embed_Watch_TopologyUp
-//   (no equivalent)                                │ TestModule_Embed_Watch_TopologyDown
-//   (no equivalent)                                │ TestModule_Embed_Watch_TopologyUpdate
+//   TestModule_Embed_ExternalPut_TriggersWatchNodeUp│ （已在 module_embed_integration_test.go 中）
+//   （无对应）                                     │ TestModule_Embed_Watch_NodeDown
+//   （无对应）                                     │ TestModule_Embed_Watch_NodeUpdate
+//   （无对应）                                     │ TestModule_Embed_Watch_TopologyUp
+//   （无对应）                                     │ TestModule_Embed_Watch_TopologyDown
+//   （无对应）                                     │ TestModule_Embed_Watch_TopologyUpdate
 
 import (
 	"context"
@@ -36,9 +36,9 @@ import (
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
 )
 
-// marshalTopologyJSON encodes info as proto-JSON using proto field names,
-// matching the format written by RegistrationActor (codec.MarshalTopologyToJSON)
-// and decodable by decodeTopologyInfo in WatchActor.
+// marshalTopologyJSON 将 info 编码为 proto-JSON（使用 proto 字段名），
+// 格式与 RegistrationActor（codec.MarshalTopologyToJSON）写入的格式一致，
+// 可被 WatchActor 中的 decodeTopologyInfo 正确解码。
 func marshalTopologyJSON(t *testing.T, info *pb.AtappTopologyInfo) string {
 	t.Helper()
 	opts := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: false}
@@ -47,20 +47,20 @@ func marshalTopologyJSON(t *testing.T, info *pb.AtappTopologyInfo) string {
 	return string(b)
 }
 
-// ── Discovery watch tests ─────────────────────────────────────────────────
+// ── Discovery watch 测试 ─────────────────────────────────────────────────
 
-// TestModule_Embed_Watch_NodeDown verifies the full Delete pipeline:
+// TestModule_Embed_Watch_NodeDown 验证完整的删除流水线：
 //
-//  1. External PUT fires EventWatchNodeUp, node appears in snapshot.
-//  2. External DELETE fires EventWatchNodeDown with nil Value.
-//  3. ProjectionActor removes the node from the snapshot.
+//  1. 外部 PUT 触发 EventWatchNodeUp，节点出现在快照中。
+//  2. 外部 DELETE 触发 EventWatchNodeDown，Payload.Value 为 nil。
+//  3. ProjectionActor 将该节点从快照中移除。
 func TestModule_Embed_Watch_NodeDown(t *testing.T) {
 	etcdAddr := embedEtcdEndpoint(t)
 	m := startEmbedModule(t, etcdAddr, []string{embedByIDPrefix})
 	ch := subscribeEmbedEvents(t, m)
 
-	// Wait for the initial empty snapshot so the Watch stream is established
-	// from a known revision; subsequent mutations will land in the stream.
+	// 等待初始空快照，确认 Watch 流已从已知 revision 建立；
+	// 后续写入操作可以确保落到该流中。
 	waitForEmbedEvent(t, ch, modulev2.EventWatchSnapshotLoaded, 15*time.Second)
 
 	extCli := newEmbedClient(t, etcdAddr)
@@ -70,40 +70,41 @@ func TestModule_Embed_Watch_NodeDown(t *testing.T) {
 	putCtx, putCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer putCancel()
 	_, err := extCli.Put(putCtx, nodeKey, marshalDiscoveryJSON(t, disc))
-	require.NoError(t, err, "PUT fixture node")
+	require.NoError(t, err, "PUT 写入测试节点")
 
-	// Wait for NodeUp and snapshot to reflect the new node.
+	// 等待 NodeUp 事件，再等待 ProjectionActor mailbox goroutine 完成快照更新
+	// 并发布 EventProjectionSnapshotUpdated，然后直接断言。
 	waitForEmbedEvent(t, ch, modulev2.EventWatchNodeUp, 5*time.Second)
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		return snap != nil && snap.Discovery.NodesByPath[nodeKey] != nil
-	}, 3*time.Second, 20*time.Millisecond, "node must appear in snapshot after PUT")
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap := m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.NotNil(t, snap.Discovery.NodesByPath[nodeKey], "PUT 后节点必须出现在快照中")
 
-	// DELETE the node.
+	// 删除该节点。
 	delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer delCancel()
 	_, err = extCli.Delete(delCtx, nodeKey)
-	require.NoError(t, err, "DELETE fixture node")
+	require.NoError(t, err, "DELETE 测试节点")
 
-	// Watch stream must deliver EventWatchNodeDown.
+	// Watch 流必须下发 EventWatchNodeDown。
 	env := waitForEmbedEvent(t, ch, modulev2.EventWatchNodeDown, 5*time.Second)
 	pl, ok := env.Payload.(modulev2.WatchNodePayload)
-	require.True(t, ok, "payload must be WatchNodePayload")
+	require.True(t, ok, "Payload 必须是 WatchNodePayload")
 	assert.Equal(t, nodeKey, pl.Key)
-	assert.Nil(t, pl.Value, "WatchNodePayload.Value must be nil for Down events")
+	assert.Nil(t, pl.Value, "Down 事件的 WatchNodePayload.Value 必须为 nil")
 
-	// ProjectionActor must remove the node from the snapshot.
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		return snap != nil && snap.Discovery.NodesByPath[nodeKey] == nil
-	}, 3*time.Second, 20*time.Millisecond, "node must be absent from snapshot after DELETE")
+	// ProjectionActor 必须将该节点从快照中移除。
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap = m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.Nil(t, snap.Discovery.NodesByPath[nodeKey], "DELETE 后节点必须从快照中消失")
 }
 
-// TestModule_Embed_Watch_NodeUpdate verifies the full Update pipeline:
+// TestModule_Embed_Watch_NodeUpdate 验证完整的更新流水线：
 //
-//  1. External PUT fires EventWatchNodeUp, node appears in snapshot.
-//  2. Second PUT on the same key fires EventWatchNodeUpdate with updated Value.
-//  3. ProjectionActor updates the snapshot to reflect the new value.
+//  1. 外部 PUT 触发 EventWatchNodeUp，节点出现在快照中。
+//  2. 对同一 key 的第二次 PUT 触发 EventWatchNodeUpdate，携带更新后的 Value。
+//  3. ProjectionActor 将快照中的数据更新为新值。
 func TestModule_Embed_Watch_NodeUpdate(t *testing.T) {
 	etcdAddr := embedEtcdEndpoint(t)
 	m := startEmbedModule(t, etcdAddr, []string{embedByIDPrefix})
@@ -117,49 +118,50 @@ func TestModule_Embed_Watch_NodeUpdate(t *testing.T) {
 	putCtx, putCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer putCancel()
 
-	// Initial PUT.
+	// 初始 PUT。
 	_, err := extCli.Put(putCtx, nodeKey, marshalDiscoveryJSON(t, &pb.AtappDiscovery{Id: 500, Name: "original-name"}))
-	require.NoError(t, err, "initial PUT")
+	require.NoError(t, err, "初始 PUT")
 
 	waitForEmbedEvent(t, ch, modulev2.EventWatchNodeUp, 5*time.Second)
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		n := snap.Discovery.NodesByPath[nodeKey]
-		return n != nil && n.Info.GetName() == "original-name"
-	}, 3*time.Second, 20*time.Millisecond, "node must appear with original name")
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap := m.GetSnapshot()
+	require.NotNil(t, snap)
+	n := snap.Discovery.NodesByPath[nodeKey]
+	require.NotNil(t, n, "节点必须以原始名称出现在快照中")
+	assert.Equal(t, "original-name", n.Info.GetName())
 
-	// UPDATE: same key, new value.
+	// 更新：相同 key，新 value。
 	updCtx, updCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer updCancel()
 	_, err = extCli.Put(updCtx, nodeKey, marshalDiscoveryJSON(t, &pb.AtappDiscovery{Id: 500, Name: "updated-name"}))
-	require.NoError(t, err, "update PUT")
+	require.NoError(t, err, "更新 PUT")
 
-	// Watch stream must deliver EventWatchNodeUpdate with the new decoded value.
+	// Watch 流必须下发携带新解码值的 EventWatchNodeUpdate。
 	env := waitForEmbedEvent(t, ch, modulev2.EventWatchNodeUpdate, 5*time.Second)
 	pl, ok := env.Payload.(modulev2.WatchNodePayload)
-	require.True(t, ok, "payload must be WatchNodePayload")
+	require.True(t, ok, "Payload 必须是 WatchNodePayload")
 	assert.Equal(t, nodeKey, pl.Key)
-	require.NotNil(t, pl.Value, "WatchNodePayload.Value must not be nil for Update events")
+	require.NotNil(t, pl.Value, "Update 事件的 WatchNodePayload.Value 不能为 nil")
 	assert.Equal(t, uint64(500), pl.Value.GetId())
 	assert.Equal(t, "updated-name", pl.Value.GetName())
 
-	// Snapshot must reflect the updated name.
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		n := snap.Discovery.NodesByPath[nodeKey]
-		return n != nil && n.Info.GetName() == "updated-name"
-	}, 3*time.Second, 20*time.Millisecond, "snapshot must reflect updated node name")
+	// 快照必须反映更新后的名称。
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap = m.GetSnapshot()
+	require.NotNil(t, snap)
+	n = snap.Discovery.NodesByPath[nodeKey]
+	require.NotNil(t, n, "快照必须反映节点的更新名称")
+	assert.Equal(t, "updated-name", n.Info.GetName())
 }
 
-// TestModule_Embed_Watch_InitialSnapshot_WithNodes verifies that nodes
-// already in etcd when AddWatchPrefix is called appear in the
-// WatchSnapshotLoadedPayload.Nodes (initial Get snapshot), not as incremental
-// NodeUp events.
+// TestModule_Embed_Watch_InitialSnapshot_WithNodes 验证：调用 AddWatchPrefix
+// 时 etcd 中已存在的节点会出现在 WatchSnapshotLoadedPayload.Nodes（初始 Get 快照）
+// 中，而不是作为增量 NodeUp 事件下发。
 func TestModule_Embed_Watch_InitialSnapshot_WithNodes(t *testing.T) {
 	etcdAddr := embedEtcdEndpoint(t)
 	extCli := newEmbedClient(t, etcdAddr)
 
-	// Pre-PUT nodes BEFORE the module starts watching this prefix.
+	// 在模块开始监听该前缀之前，先向 etcd 写入节点。
 	preCtx, preCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer preCancel()
 
@@ -172,41 +174,38 @@ func TestModule_Embed_Watch_InitialSnapshot_WithNodes(t *testing.T) {
 	_, err = extCli.Put(preCtx, keys[1], marshalDiscoveryJSON(t, &pb.AtappDiscovery{Id: 602, Name: "pre-602"}))
 	require.NoError(t, err)
 
-	// Start module WITHOUT watch prefixes so subscription is set up before
-	// the initial Get is triggered.
+	// 不带 watch 前缀启动模块，确保订阅先于初始 Get 建立。
 	m := startEmbedModule(t, etcdAddr, nil)
 	ch := subscribeEmbedEvents(t, m)
 
-	// AddWatchPrefix triggers the initial Get — nodes already in etcd will
-	// appear in the Loaded payload, not as incremental NodeUp events.
+	// AddWatchPrefix 触发初始 Get——etcd 中已存在的节点将出现在
+	// Loaded payload 中，而非作为增量 NodeUp 事件下发。
 	require.NoError(t, m.AddWatchPrefix(embedByIDPrefix))
 
 	loadedEnv := waitForEmbedEvent(t, ch, modulev2.EventWatchSnapshotLoaded, 15*time.Second)
 	lpl, ok := loadedEnv.Payload.(modulev2.WatchSnapshotLoadedPayload)
-	require.True(t, ok, "payload must be WatchSnapshotLoadedPayload")
+	require.True(t, ok, "Payload 必须是 WatchSnapshotLoadedPayload")
 	assert.Equal(t, embedByIDPrefix, lpl.Prefix)
 
-	// Both pre-existing nodes must appear in the snapshot payload.
-	require.Len(t, lpl.Nodes, 2, "initial Get must capture both pre-existing nodes")
+	// 两个预写节点必须出现在快照 payload 中。
+	require.Len(t, lpl.Nodes, 2, "初始 Get 必须捕获两个预写节点")
 	require.Contains(t, lpl.Nodes, keys[0])
 	require.Contains(t, lpl.Nodes, keys[1])
 	assert.Equal(t, "pre-601", lpl.Nodes[keys[0]].Info.GetName())
 	assert.Equal(t, "pre-602", lpl.Nodes[keys[1]].Info.GetName())
 
-	// GetSnapshot must also contain both nodes after ProjectionActor applies the event.
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		return snap != nil &&
-			snap.Discovery.NodesByPath[keys[0]] != nil &&
-			snap.Discovery.NodesByPath[keys[1]] != nil
-	}, 3*time.Second, 20*time.Millisecond, "snapshot must reflect both pre-existing nodes")
+	// ProjectionActor 应用事件后，GetSnapshot 也必须包含两个节点。
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap := m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.NotNil(t, snap.Discovery.NodesByPath[keys[0]], "快照必须包含节点 keys[0]")
+	assert.NotNil(t, snap.Discovery.NodesByPath[keys[1]], "快照必须包含节点 keys[1]")
 }
 
-// ── Topology watch tests ──────────────────────────────────────────────────
+// ── Topology watch 测试 ───────────────────────────────────────────────────
 
-// TestModule_Embed_Watch_TopologyUp verifies that an external PUT under the
-// topology prefix fires EventWatchTopologyUp and the node appears in the topology
-// sub-view of GetSnapshot.
+// TestModule_Embed_Watch_TopologyUp 验证：外部向 topology 前缀下 PUT 数据后，
+// 触发 EventWatchTopologyUp，并且节点出现在 GetSnapshot 的 topology 子视图中。
 func TestModule_Embed_Watch_TopologyUp(t *testing.T) {
 	etcdAddr := embedEtcdEndpoint(t)
 	m := startEmbedModule(t, etcdAddr, []string{embedTopoPrefix})
@@ -221,36 +220,31 @@ func TestModule_Embed_Watch_TopologyUp(t *testing.T) {
 	putCtx, putCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer putCancel()
 	_, err := extCli.Put(putCtx, topoKey, marshalTopologyJSON(t, topoInfo))
-	require.NoError(t, err, "PUT topology node")
+	require.NoError(t, err, "PUT topology 节点")
 
-	// Watch stream must deliver EventWatchTopologyUp.
+	// Watch 流必须下发 EventWatchTopologyUp。
 	env := waitForEmbedEvent(t, ch, modulev2.EventWatchTopologyUp, 5*time.Second)
 	pl, ok := env.Payload.(modulev2.WatchTopologyPayload)
-	require.True(t, ok, "payload must be WatchTopologyPayload")
+	require.True(t, ok, "Payload 必须是 WatchTopologyPayload")
 	assert.Equal(t, topoKey, pl.Key)
-	require.NotNil(t, pl.Value, "WatchTopologyPayload.Value must not be nil for Up events")
+	require.NotNil(t, pl.Value, "Up 事件的 WatchTopologyPayload.Value 不能为 nil")
 	assert.Equal(t, uint64(700), pl.Value.GetId())
 	assert.Equal(t, "topo-700", pl.Value.GetName())
 
-	// Topology snapshot must contain the new node.
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		return snap != nil && snap.Topology.NodesByID[700] != nil
-	}, 3*time.Second, 20*time.Millisecond, "topology snapshot must contain node 700")
-
+	// topology 快照必须包含新节点。
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
 	snap := m.GetSnapshot()
 	require.NotNil(t, snap)
 	topoNode := snap.Topology.NodesByID[700]
-	require.NotNil(t, topoNode)
+	require.NotNil(t, topoNode, "topology 快照必须包含节点 700")
 	assert.Equal(t, "topo-700", topoNode.Info.GetName())
 }
 
-// TestModule_Embed_Watch_TopologyDown verifies the full DELETE pipeline for
-// topology:
+// TestModule_Embed_Watch_TopologyDown 验证 topology 的完整删除流水线：
 //
-//  1. External PUT fires EventWatchTopologyUp, node appears in snapshot.
-//  2. External DELETE fires EventWatchTopologyDown.
-//  3. ProjectionActor removes the node from the topology snapshot.
+//  1. 外部 PUT 触发 EventWatchTopologyUp，节点出现在快照中。
+//  2. 外部 DELETE 触发 EventWatchTopologyDown。
+//  3. ProjectionActor 将该节点从 topology 快照中移除。
 func TestModule_Embed_Watch_TopologyDown(t *testing.T) {
 	etcdAddr := embedEtcdEndpoint(t)
 	m := startEmbedModule(t, etcdAddr, []string{embedTopoPrefix})
@@ -265,37 +259,36 @@ func TestModule_Embed_Watch_TopologyDown(t *testing.T) {
 	putCtx, putCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer putCancel()
 	_, err := extCli.Put(putCtx, topoKey, marshalTopologyJSON(t, topoInfo))
-	require.NoError(t, err, "PUT topology node")
+	require.NoError(t, err, "PUT topology 节点")
 
 	waitForEmbedEvent(t, ch, modulev2.EventWatchTopologyUp, 5*time.Second)
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		return snap != nil && snap.Topology.NodesByID[800] != nil
-	}, 3*time.Second, 20*time.Millisecond, "topology snapshot must contain node 800")
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap := m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.NotNil(t, snap.Topology.NodesByID[800], "topology 快照必须包含节点 800")
 
-	// DELETE the topology node.
+	// 删除该 topology 节点。
 	delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer delCancel()
 	_, err = extCli.Delete(delCtx, topoKey)
-	require.NoError(t, err, "DELETE topology node")
+	require.NoError(t, err, "DELETE topology 节点")
 
-	// Watch stream must deliver EventWatchTopologyDown.
-	// WatchActor sets WithPrevKV() so Value carries the decoded previous value.
+	// Watch 流必须下发 EventWatchTopologyDown。
+	// WatchActor 设置了 WithPrevKV()，Value 携带解码后的旧值。
 	env := waitForEmbedEvent(t, ch, modulev2.EventWatchTopologyDown, 5*time.Second)
 	pl, ok := env.Payload.(modulev2.WatchTopologyPayload)
-	require.True(t, ok, "payload must be WatchTopologyPayload")
+	require.True(t, ok, "Payload 必须是 WatchTopologyPayload")
 	assert.Equal(t, topoKey, pl.Key)
 
-	// ProjectionActor must remove the node from the topology snapshot.
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		return snap != nil && snap.Topology.NodesByID[800] == nil
-	}, 3*time.Second, 20*time.Millisecond, "topology snapshot must not contain node 800 after DELETE")
+	// ProjectionActor 必须将该节点从 topology 快照中移除。
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap = m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.Nil(t, snap.Topology.NodesByID[800], "DELETE 后 topology 快照不应包含节点 800")
 }
 
-// TestModule_Embed_Watch_TopologyUpdate verifies that a second PUT on an
-// existing topology key fires EventWatchTopologyUpdate and the snapshot
-// reflects the updated data.
+// TestModule_Embed_Watch_TopologyUpdate 验证：对已存在 topology key 的第二次 PUT
+// 触发 EventWatchTopologyUpdate，并且快照反映更新后的数据。
 func TestModule_Embed_Watch_TopologyUpdate(t *testing.T) {
 	etcdAddr := embedEtcdEndpoint(t)
 	m := startEmbedModule(t, etcdAddr, []string{embedTopoPrefix})
@@ -309,48 +302,50 @@ func TestModule_Embed_Watch_TopologyUpdate(t *testing.T) {
 	putCtx, putCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer putCancel()
 
-	// Initial PUT (Version becomes 1).
+	// 初始 PUT（Version 变为 1）。
 	_, err := extCli.Put(putCtx, topoKey, marshalTopologyJSON(t, &pb.AtappTopologyInfo{Id: 900, Name: "original-topo"}))
-	require.NoError(t, err, "initial PUT")
+	require.NoError(t, err, "初始 PUT")
 
 	waitForEmbedEvent(t, ch, modulev2.EventWatchTopologyUp, 5*time.Second)
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		n := snap.Topology.NodesByID[900]
-		return n != nil && n.Info.GetName() == "original-topo"
-	}, 3*time.Second, 20*time.Millisecond, "topology snapshot must reflect original name")
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap := m.GetSnapshot()
+	require.NotNil(t, snap)
+	topo := snap.Topology.NodesByID[900]
+	require.NotNil(t, topo, "topology 快照必须反映原始名称")
+	assert.Equal(t, "original-topo", topo.Info.GetName())
 
-	// UPDATE: same key, new name (Version becomes 2 → EventWatchTopologyUpdate).
+	// 更新：相同 key，新名称（Version 变为 2 → EventWatchTopologyUpdate）。
 	updCtx, updCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer updCancel()
 	_, err = extCli.Put(updCtx, topoKey, marshalTopologyJSON(t, &pb.AtappTopologyInfo{Id: 900, Name: "updated-topo"}))
-	require.NoError(t, err, "update PUT")
+	require.NoError(t, err, "更新 PUT")
 
-	// Watch stream must deliver EventWatchTopologyUpdate (Version > 1).
+	// Watch 流必须下发 EventWatchTopologyUpdate（Version > 1）。
 	env := waitForEmbedEvent(t, ch, modulev2.EventWatchTopologyUpdate, 5*time.Second)
 	pl, ok := env.Payload.(modulev2.WatchTopologyPayload)
-	require.True(t, ok, "payload must be WatchTopologyPayload")
+	require.True(t, ok, "Payload 必须是 WatchTopologyPayload")
 	assert.Equal(t, topoKey, pl.Key)
-	require.NotNil(t, pl.Value, "WatchTopologyPayload.Value must not be nil for Update events")
+	require.NotNil(t, pl.Value, "Update 事件的 WatchTopologyPayload.Value 不能为 nil")
 	assert.Equal(t, uint64(900), pl.Value.GetId())
 	assert.Equal(t, "updated-topo", pl.Value.GetName())
 
-	// Snapshot must reflect the updated name.
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		n := snap.Topology.NodesByID[900]
-		return n != nil && n.Info.GetName() == "updated-topo"
-	}, 3*time.Second, 20*time.Millisecond, "topology snapshot must reflect updated name")
+	// 快照必须反映更新后的名称。
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap = m.GetSnapshot()
+	require.NotNil(t, snap)
+	topo = snap.Topology.NodesByID[900]
+	require.NotNil(t, topo, "topology 快照必须反映更新后的名称")
+	assert.Equal(t, "updated-topo", topo.Info.GetName())
 }
 
-// TestModule_Embed_Watch_InitialTopologySnapshot_WithNodes verifies that
-// topology nodes already in etcd when the topology prefix is added appear in
-// the WatchTopologySnapshotLoadedPayload.Nodes map (initial Get snapshot).
+// TestModule_Embed_Watch_InitialTopologySnapshot_WithNodes 验证：添加 topology
+// 前缀时 etcd 中已存在的 topology 节点会出现在
+// WatchTopologySnapshotLoadedPayload.Nodes map（初始 Get 快照）中。
 func TestModule_Embed_Watch_InitialTopologySnapshot_WithNodes(t *testing.T) {
 	etcdAddr := embedEtcdEndpoint(t)
 	extCli := newEmbedClient(t, etcdAddr)
 
-	// Pre-PUT topology nodes BEFORE the module starts watching.
+	// 在模块开始监听之前，先向 etcd 写入 topology 节点。
 	preCtx, preCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer preCancel()
 
@@ -361,8 +356,7 @@ func TestModule_Embed_Watch_InitialTopologySnapshot_WithNodes(t *testing.T) {
 		marshalTopologyJSON(t, &pb.AtappTopologyInfo{Id: 1002, Name: "pre-topo-1002"}))
 	require.NoError(t, err)
 
-	// Start module WITHOUT prefixes so subscription is set up before the
-	// initial Get is triggered.
+	// 不带前缀启动模块，确保订阅先于初始 Get 建立。
 	m := startEmbedModule(t, etcdAddr, nil)
 	ch := subscribeEmbedEvents(t, m)
 
@@ -370,20 +364,19 @@ func TestModule_Embed_Watch_InitialTopologySnapshot_WithNodes(t *testing.T) {
 
 	loadedEnv := waitForEmbedEvent(t, ch, modulev2.EventWatchTopologySnapshotLoaded, 15*time.Second)
 	lpl, ok := loadedEnv.Payload.(modulev2.WatchTopologySnapshotLoadedPayload)
-	require.True(t, ok, "payload must be WatchTopologySnapshotLoadedPayload")
+	require.True(t, ok, "Payload 必须是 WatchTopologySnapshotLoadedPayload")
 
-	// Both pre-existing topology nodes must appear in the snapshot payload.
-	require.Len(t, lpl.Nodes, 2, "initial Get must capture both pre-existing topology nodes")
+	// 两个预写 topology 节点必须出现在快照 payload 中。
+	require.Len(t, lpl.Nodes, 2, "初始 Get 必须捕获两个预写 topology 节点")
 	require.Contains(t, lpl.Nodes, uint64(1001))
 	require.Contains(t, lpl.Nodes, uint64(1002))
 	assert.Equal(t, "pre-topo-1001", lpl.Nodes[1001].Info.GetName())
 	assert.Equal(t, "pre-topo-1002", lpl.Nodes[1002].Info.GetName())
 
-	// GetSnapshot topology must also contain both nodes.
-	require.Eventually(t, func() bool {
-		snap := m.GetSnapshot()
-		return snap != nil &&
-			snap.Topology.NodesByID[1001] != nil &&
-			snap.Topology.NodesByID[1002] != nil
-	}, 3*time.Second, 20*time.Millisecond, "topology snapshot must reflect both pre-existing nodes")
+	// GetSnapshot topology 也必须包含两个节点。
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap := m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.NotNil(t, snap.Topology.NodesByID[1001], "topology 快照必须包含节点 1001")
+	assert.NotNil(t, snap.Topology.NodesByID[1002], "topology 快照必须包含节点 1002")
 }

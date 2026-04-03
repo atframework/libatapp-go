@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -23,6 +24,11 @@ import (
 
 // regMsg is the sealed interface for all RegistrationActor mailbox messages.
 type regMsg interface{ regMsgKind() }
+
+// ErrNoLease is returned by FlushTopology (and onSyncTopology) when no active
+// lease is held.  Callers may use errors.Is to distinguish this condition from
+// a real etcd write failure.
+var ErrNoLease = errors.New("registration: no active lease")
 
 // RegMsgType enumerates message kinds for logging and metrics.
 type RegMsgType uint8
@@ -94,9 +100,13 @@ type regMsgFlushTopology struct {
 }
 type regMsgReplayDiscovery struct {
 	ServiceKey string
+	// LeaseEpoch is the epoch at which this replay was scheduled.  The handler
+	// discards the message if the current epoch has advanced (lease rebuilt).
+	LeaseEpoch uint64
 }
 type regMsgReplayTopology struct {
 	TopologyKey string
+	LeaseEpoch  uint64
 }
 
 func (regMsgLeaseGranted) regMsgKind()    {}
@@ -124,6 +134,26 @@ type discoveryRegistrationEntry struct {
 	updatedAt  time.Time
 }
 
+func (e *discoveryRegistrationEntry) markRegistered() {
+	e.registered = true
+	e.stale = false
+	e.retryCount = 0
+	e.lastError = nil
+	e.updatedAt = time.Now()
+}
+
+func (e *discoveryRegistrationEntry) markFailed(err error) {
+	e.stale = true
+	e.registered = false
+	e.lastError = err
+	e.retryCount++
+}
+
+func (e *discoveryRegistrationEntry) markExpired() {
+	e.registered = false
+	e.stale = true
+}
+
 // topologyRegistrationEntry tracks desired/actual state for topology keepalive keys.
 type topologyRegistrationEntry struct {
 	info       *pb.AtappTopologyInfo
@@ -137,6 +167,26 @@ type topologyRegistrationEntry struct {
 	updatedAt  time.Time
 }
 
+func (e *topologyRegistrationEntry) markRegistered() {
+	e.registered = true
+	e.stale = false
+	e.retryCount = 0
+	e.lastError = nil
+	e.updatedAt = time.Now()
+}
+
+func (e *topologyRegistrationEntry) markFailed(err error) {
+	e.stale = true
+	e.registered = false
+	e.lastError = err
+	e.retryCount++
+}
+
+func (e *topologyRegistrationEntry) markExpired() {
+	e.registered = false
+	e.stale = true
+}
+
 // registrationActorState is all mutable state owned by the RegistrationActor's
 // run goroutine.  No locking required.
 type registrationActorState struct {
@@ -145,6 +195,11 @@ type registrationActorState struct {
 	discoveryServices  map[string]discoveryRegistrationEntry // key = service path
 	topologyServices   map[string]topologyRegistrationEntry  // key = topology key
 	serviceTopologyKey map[string]string                     // service path -> topology key
+	// pendingReplayCount tracks how many ReplayDiscovery/ReplayTopology messages
+	// were enqueued by the most recent onLeaseGranted.  The last one to complete
+	// successfully decrements the counter to 0 and publishes a single
+	// RegistrationChanged event, avoiding N burst events per lease rebuild.
+	pendingReplayCount int
 }
 
 // ── RegistrationActor ────────────────────────────────────────────────────
@@ -303,7 +358,7 @@ func (a *RegistrationActor) handle(msg regMsg) {
 	case regMsgRemoveService:
 		a.onRemoveService(m)
 	case regMsgSyncTopology:
-		a.onSyncTopology()
+		a.onSyncTopology(context.Background())
 	case regMsgFlushTopology:
 		a.onFlushTopology(m)
 	case regMsgReplayDiscovery:
@@ -316,33 +371,47 @@ func (a *RegistrationActor) handle(msg regMsg) {
 func (a *RegistrationActor) onLeaseExpired() {
 	// Mark all services as stale; etcd TTL will GC the keys automatically.
 	for key, svc := range a.st.discoveryServices {
-		svc.registered = false
-		svc.stale = true
+		svc.markExpired()
 		a.st.discoveryServices[key] = svc
 	}
 	for key, svc := range a.st.topologyServices {
-		svc.registered = false
-		svc.stale = true
+		svc.markExpired()
 		a.st.topologyServices[key] = svc
 	}
 	a.st.leaseID = 0
 }
 
 func (a *RegistrationActor) onLeaseGranted(msg regMsgLeaseGranted) {
+	if a.st.leaseID == msg.LeaseID {
+		// Duplicate event for the current lease (e.g. bus fires twice); replays
+		// already enqueued — ignore to avoid resetting pendingReplayCount.
+		return
+	}
 	a.st.leaseID = msg.LeaseID
 	a.st.leaseEpoch = msg.LeaseEpoch
-	// Enqueue a replay message for every desired service that is stale or
-	// not yet registered under the new lease.
+	// Count and enqueue replay messages for every desired service that is stale
+	// or not yet registered under the new lease.  pendingReplayCount lets the
+	// last successful replay publish a single RegistrationChanged event instead
+	// of one per service.
+	count := 0
 	for key, svc := range a.st.discoveryServices {
 		if svc.desired && (svc.stale || !svc.registered) {
-			a.Post(regMsgReplayDiscovery{ServiceKey: key})
+			// Reset backoff counter so a brand-new lease epoch starts from 0.
+			svc.retryCount = 0
+			a.st.discoveryServices[key] = svc
+			a.Post(regMsgReplayDiscovery{ServiceKey: key, LeaseEpoch: msg.LeaseEpoch})
+			count++
 		}
 	}
 	for key, svc := range a.st.topologyServices {
 		if svc.desired && (svc.stale || !svc.registered) {
-			a.Post(regMsgReplayTopology{TopologyKey: key})
+			svc.retryCount = 0
+			a.st.topologyServices[key] = svc
+			a.Post(regMsgReplayTopology{TopologyKey: key, LeaseEpoch: msg.LeaseEpoch})
+			count++
 		}
 	}
+	a.st.pendingReplayCount = count
 }
 
 func (a *RegistrationActor) onAddDiscovery(msg regMsgAddDiscovery) {
@@ -367,20 +436,15 @@ func (a *RegistrationActor) onAddDiscovery(msg regMsgAddDiscovery) {
 		return
 	}
 
-	if err := a.putDiscoveryWithLease(discoveryEntry); err != nil {
+	if err := a.putDiscoveryWithLease(context.Background(), discoveryEntry); err != nil {
 		if msg.Reply != nil {
 			msg.Reply <- err
 		}
-		discoveryEntry.stale = true
-		discoveryEntry.registered = false
-		discoveryEntry.lastError = err
+		discoveryEntry.markFailed(err)
 		a.st.discoveryServices[msg.Path] = discoveryEntry
 		return
 	}
-	discoveryEntry.registered = true
-	discoveryEntry.stale = false
-	discoveryEntry.lastError = nil
-	discoveryEntry.updatedAt = time.Now()
+	discoveryEntry.markRegistered()
 	a.st.discoveryServices[msg.Path] = discoveryEntry
 	a.publishRegistrationChanged()
 	if msg.Reply != nil {
@@ -424,22 +488,17 @@ func (a *RegistrationActor) onAddTopology(msg regMsgAddTopology) {
 		return
 	}
 
-	if err := a.putTopologyWithLease(topologyEntry); err != nil {
-		topologyEntry.stale = true
-		topologyEntry.registered = false
-		topologyEntry.lastError = err
-		topologyEntry.retryCount++
+	if err := a.putTopologyWithLease(context.Background(), topologyEntry); err != nil {
+		topologyEntry.markFailed(err)
 		a.st.topologyServices[topologyKey] = topologyEntry
 		if msg.Reply != nil {
 			msg.Reply <- err
 		}
 		return
 	}
-	topologyEntry.registered = true
-	topologyEntry.stale = false
-	topologyEntry.lastError = nil
-	topologyEntry.updatedAt = time.Now()
+	topologyEntry.markRegistered()
 	a.st.topologyServices[topologyKey] = topologyEntry
+	a.publishRegistrationChanged()
 
 	if msg.Reply != nil {
 		msg.Reply <- nil
@@ -484,31 +543,34 @@ func (a *RegistrationActor) onRemoveService(msg regMsgRemoveService) {
 	}
 }
 
-func (a *RegistrationActor) onSyncTopology() {
+func (a *RegistrationActor) onSyncTopology(ctx context.Context) error {
 	// Topology keepalive is a specialised flush; put it in the same lease.
 	if a.st.leaseID == 0 {
-		return
+		return ErrNoLease
 	}
+	var firstErr error
 	for key, svc := range a.st.topologyServices {
 		if !svc.desired || !svc.registered {
 			continue
 		}
-		if err := a.putTopologyWithLease(svc); err != nil {
+		if err := a.putTopologyWithLease(ctx, svc); err != nil {
 			log.Warn("[RegistrationActor] topology sync failed",
 				"key", key,
 				"err", err)
-			svc.stale = true
-			svc.lastError = err
-			svc.retryCount++
+			svc.markFailed(err)
 			a.st.topologyServices[key] = svc
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
+	return firstErr
 }
 
 func (a *RegistrationActor) onFlushTopology(msg regMsgFlushTopology) {
-	a.onSyncTopology()
+	err := a.onSyncTopology(msg.Ctx)
 	if msg.Reply != nil {
-		msg.Reply <- nil
+		msg.Reply <- err
 	}
 }
 
@@ -517,24 +579,35 @@ func (a *RegistrationActor) onReplayDiscovery(msg regMsgReplayDiscovery) {
 	if !ok || !svc.desired || a.st.leaseID == 0 {
 		return
 	}
-	if err := a.putDiscoveryWithLease(svc); err != nil {
+	// Discard replays that were scheduled for a stale lease epoch.
+	if msg.LeaseEpoch != a.st.leaseEpoch {
+		return
+	}
+	if err := a.putDiscoveryWithLease(context.Background(), svc); err != nil {
 		log.Warn("[RegistrationActor] replay discovery write failed",
 			"key", msg.ServiceKey,
 			"retry", svc.retryCount,
 			"err", err)
-		svc.retryCount++
-		svc.lastError = err
-		svc.stale = true
+		svc.markFailed(err)
 		a.st.discoveryServices[msg.ServiceKey] = svc
+		// Schedule an exponential-backoff retry; the epoch guard above ensures
+		// that delayed messages from a dead lease are silently dropped.
+		delay := backoffDuration(svc.retryCount)
+		leaseEpoch := a.st.leaseEpoch
+		serviceKey := msg.ServiceKey
+		time.AfterFunc(delay, func() {
+			a.Post(regMsgReplayDiscovery{ServiceKey: serviceKey, LeaseEpoch: leaseEpoch})
+		})
 		return
 	}
-	svc.registered = true
-	svc.stale = false
-	svc.retryCount = 0
-	svc.lastError = nil
-	svc.updatedAt = time.Now()
+	svc.markRegistered()
 	a.st.discoveryServices[msg.ServiceKey] = svc
-	a.publishRegistrationChanged()
+	if a.st.pendingReplayCount > 0 {
+		a.st.pendingReplayCount--
+	}
+	if a.st.pendingReplayCount == 0 {
+		a.publishRegistrationChanged()
+	}
 }
 
 func (a *RegistrationActor) onReplayTopology(msg regMsgReplayTopology) {
@@ -542,32 +615,42 @@ func (a *RegistrationActor) onReplayTopology(msg regMsgReplayTopology) {
 	if !ok || !svc.desired || a.st.leaseID == 0 {
 		return
 	}
-	if err := a.putTopologyWithLease(svc); err != nil {
+	// Discard replays that were scheduled for a stale lease epoch.
+	if msg.LeaseEpoch != a.st.leaseEpoch {
+		return
+	}
+	if err := a.putTopologyWithLease(context.Background(), svc); err != nil {
 		log.Warn("[RegistrationActor] replay topology write failed",
 			"key", msg.TopologyKey,
 			"retry", svc.retryCount,
 			"err", err)
-		svc.retryCount++
-		svc.lastError = err
-		svc.stale = true
+		svc.markFailed(err)
 		a.st.topologyServices[msg.TopologyKey] = svc
+		delay := backoffDuration(svc.retryCount)
+		leaseEpoch := a.st.leaseEpoch
+		topologyKey := msg.TopologyKey
+		time.AfterFunc(delay, func() {
+			a.Post(regMsgReplayTopology{TopologyKey: topologyKey, LeaseEpoch: leaseEpoch})
+		})
 		return
 	}
-	svc.registered = true
-	svc.stale = false
-	svc.retryCount = 0
-	svc.lastError = nil
-	svc.updatedAt = time.Now()
+	svc.markRegistered()
 	a.st.topologyServices[msg.TopologyKey] = svc
+	if a.st.pendingReplayCount > 0 {
+		a.st.pendingReplayCount--
+	}
+	if a.st.pendingReplayCount == 0 {
+		a.publishRegistrationChanged()
+	}
 }
 
 // ── etcd write helpers ────────────────────────────────────────────────────
 
-func (a *RegistrationActor) putDiscoveryWithLease(svc discoveryRegistrationEntry) error {
+func (a *RegistrationActor) putDiscoveryWithLease(ctx context.Context, svc discoveryRegistrationEntry) error {
 	if svc.info == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	leaseOpt := clientv3.WithLease(a.st.leaseID)
@@ -608,7 +691,7 @@ func (a *RegistrationActor) putDiscoveryWithLease(svc discoveryRegistrationEntry
 	return nil
 }
 
-func (a *RegistrationActor) putTopologyWithLease(svc topologyRegistrationEntry) error {
+func (a *RegistrationActor) putTopologyWithLease(ctx context.Context, svc topologyRegistrationEntry) error {
 	if svc.info == nil || svc.key == "" {
 		return nil
 	}
@@ -618,7 +701,7 @@ func (a *RegistrationActor) putTopologyWithLease(svc topologyRegistrationEntry) 
 		return fmt.Errorf("marshal topology info: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	if _, err := a.etcdClient.Put(ctx, svc.key, string(topologyBytes), clientv3.WithLease(a.st.leaseID)); err != nil {
@@ -673,6 +756,24 @@ func buildTopologyKey(topologyInfo *pb.AtappTopologyInfo, topologyPrefix string)
 	return fmt.Sprintf("%s/%s-%d", topologyPrefix, topologyInfo.GetName(), topologyInfo.GetId())
 }
 
+// backoffDuration returns a capped exponential backoff: 200ms × 2^retryCount, max 30s.
+func backoffDuration(retryCount int) time.Duration {
+	const base = 200 * time.Millisecond
+	const maxBackoff = 30 * time.Second
+	if retryCount <= 0 {
+		return base
+	}
+	shift := retryCount
+	if shift > 7 { // 200ms × 128 = 25.6s; cap shift to avoid int overflow
+		shift = 7
+	}
+	d := time.Duration(1<<uint(shift)) * base
+	if d > maxBackoff {
+		return maxBackoff
+	}
+	return d
+}
+
 func cloneDiscoveryInfo(info *pb.AtappDiscovery) *pb.AtappDiscovery {
 	if info == nil {
 		return nil
@@ -687,35 +788,19 @@ func cloneTopologyInfo(info *pb.AtappTopologyInfo) *pb.AtappTopologyInfo {
 	return proto.Clone(info).(*pb.AtappTopologyInfo)
 }
 
-func buildTopologyInfoFromDiscovery(info *pb.AtappDiscovery) *pb.AtappTopologyInfo {
-	if info == nil {
-		return nil
-	}
-	if info.GetName() == "" || info.GetId() == 0 {
-		return nil
-	}
-	return &pb.AtappTopologyInfo{
-		Id:       info.GetId(),
-		Name:     info.GetName(),
-		Hostname: info.GetHostname(),
-		Pid:      info.GetPid(),
-		Identity: info.GetIdentity(),
-		Version:  info.GetVersion(),
-	}
-}
-
 // ── Event publishing ──────────────────────────────────────────────────────
 
 // buildRegistrationSnapshot assembles the current registration sub-view from
 // the in-memory service table.
-func (a *RegistrationActor) buildRegistrationSnapshot() snapshot.RegistrationSnapshot {
-	s := snapshot.RegistrationSnapshot{
-		LeaseID:    a.st.leaseID,
-		LeaseEpoch: a.st.leaseEpoch,
-		ByPath:     make(map[string]*pb.AtappDiscovery),
-		ByName:     make(map[string]*pb.AtappDiscovery),
-		ByID:       make(map[uint64]*pb.AtappDiscovery),
-		UpdatedAt:  time.Now(),
+func (a *RegistrationActor) buildRegistrationSnapshot() snapshot.SelfRegistrationSnapshot {
+	s := snapshot.SelfRegistrationSnapshot{
+		LeaseID:          a.st.leaseID,
+		LeaseEpoch:       a.st.leaseEpoch,
+		ByPath:           make(map[string]*pb.AtappDiscovery),
+		ByName:           make(map[string]*pb.AtappDiscovery),
+		ByID:             make(map[uint64]*pb.AtappDiscovery),
+		TopologyServices: make(map[string]*pb.AtappTopologyInfo),
+		UpdatedAt:        time.Now(),
 	}
 	for _, svc := range a.st.discoveryServices {
 		if !svc.registered {
@@ -729,6 +814,12 @@ func (a *RegistrationActor) buildRegistrationSnapshot() snapshot.RegistrationSna
 			s.ByID[svc.info.GetId()] = svc.info
 		}
 	}
+	for _, svc := range a.st.topologyServices {
+		if !svc.registered {
+			continue
+		}
+		s.TopologyServices[svc.key] = svc.info
+	}
 	return s
 }
 
@@ -740,6 +831,6 @@ func (a *RegistrationActor) publishRegistrationChanged() {
 		Source:     runtime.EventSourceRegistrationActor,
 		LeaseEpoch: a.st.leaseEpoch,
 		OccurredAt: time.Now(),
-		Payload:    RegistrationChangedPayload{RegistrationSnapshot: snap},
+		Payload:    RegistrationChangedPayload{SelfRegistrationSnapshot: snap},
 	})
 }

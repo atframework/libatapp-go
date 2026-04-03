@@ -671,6 +671,7 @@ func lessRoundRobinNode(left, right *DiscoveryNode) bool {
 
 	return left.Path < right.Path
 }
+
 func matchesDiscoveryFilter(info *pb.AtappDiscovery, filter map[string]string) bool {
 	if len(filter) == 0 {
 		return true

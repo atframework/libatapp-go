@@ -270,24 +270,6 @@ func TestProjectionActor_DedupeKey_PreventsDoubleApply(t *testing.T) {
 	}
 }
 
-func TestProjectionActor_LeaseExpired_ClearsRegistration(t *testing.T) {
-	bus := runtime.NewEventBus()
-	_, snapCh, cancel := startProjectionActor(t, bus)
-	defer cancel()
-
-	// Simulate a lease expiry. Registration should be cleared.
-	bus.Publish(runtime.EventEnvelope{
-		Type:       runtime.EventLeaseExpired,
-		Version:    1,
-		LeaseEpoch: 1,
-	})
-
-	snap := waitForSnapshot(t, snapCh, 3*time.Second)
-	require.NotNil(t, snap)
-	// Registration snapshot should be empty after expiry.
-	assert.Empty(t, snap.Registration.ByPath)
-}
-
 func TestProjectionActor_GetSnapshot_BeforeFirstPublish_ReturnsNil(t *testing.T) {
 	bus := runtime.NewEventBus()
 	actor := orchestrator.NewProjectionActor(bus, nil)
@@ -377,15 +359,9 @@ func TestProjectionActor_LeaseRebuild_Sequence(t *testing.T) {
 
 	// Epoch 1 expires.
 	bus.Publish(runtime.EventEnvelope{Type: runtime.EventLeaseExpired, LeaseEpoch: 1})
-	snapAfterExpiry := waitForSnapshot(t, snapCh, 3*time.Second)
-	assert.Empty(t, snapAfterExpiry.Registration.ByPath, "registration cleared on lease expiry")
 
-	// Epoch 2: new lease granted.
-	bus.Publish(runtime.EventEnvelope{Type: runtime.EventLeaseGranted, LeaseEpoch: 2})
-
-	// At this point no snapshot publish since EventLeaseGranted doesn't trigger publish.
 	// Confirm topology still holds (not cleared by lease events).
-	assert.Contains(t, allNodes(snapAfterExpiry), "/svc/by_id/10")
+	assert.Contains(t, allNodes(snapAfterNode), "/svc/by_id/10")
 }
 
 // waitForSnapshotWithin is a non-blocking drain helper.

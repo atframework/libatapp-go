@@ -88,14 +88,11 @@ func NewEtcdModuleFromConfigWithClient(cfg *pb.AtappEtcd, etcdClient *clientv3.C
 	}
 
 	pathCfg := PathConfig{
-		ByNamePrefix:     basePath + "/by_name",
-		ByIDPrefix:       basePath + "/by_id",
-		ByTypeIDPrefix:   basePath + "/by_type_id",
-		ByTypeNamePrefix: basePath + "/by_type_name",
-		ByTagPrefix:      basePath + "/by_tag",
-		TopologyPrefix:   basePath + "/topology",
-		WatchPrefixes:    []string{basePath + "/by_id", basePath + "/by_name", basePath + "/topology"},
-		LeaseTTL:         leaseTTL,
+		ByNamePrefix:   basePath + "/by_name",
+		ByIDPrefix:     basePath + "/by_id",
+		TopologyPrefix: basePath + "/topology",
+		WatchPrefixes:  []string{basePath + "/by_id", basePath + "/by_name", basePath + "/topology"},
+		LeaseTTL:       leaseTTL,
 	}
 	return NewEtcdModule(conn, pathCfg, opts), nil
 }
@@ -208,8 +205,6 @@ func parseTLSMinVersion(value string) uint16 {
 		return tls.VersionTLS11
 	case "TLS_V10", "TLS1.0", "TLS10":
 		return tls.VersionTLS10
-	case "SSL3":
-		return tls.VersionSSL30
 	case "DISABLED":
 		return 0
 	default:

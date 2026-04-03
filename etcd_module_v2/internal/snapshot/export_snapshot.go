@@ -292,8 +292,6 @@ const (
 	SnapshotCauseDiscovery SnapshotCause = 1
 	// SnapshotCauseTopology means only the Topology sub-tree changed.
 	SnapshotCauseTopology SnapshotCause = 2
-	// SnapshotCauseRegistration means only the Registration sub-tree changed.
-	SnapshotCauseRegistration SnapshotCause = 3
 )
 
 // ── ExportSnapshot ────────────────────────────────────────────────────────
@@ -301,15 +299,17 @@ const (
 // ExportSnapshot is the single, atomically-published read-model exported by
 // ProjectionActor.  Callers obtain a pointer via EtcdModule.GetSnapshot() and
 // may read it lock-free; they must not mutate any field.
+//
+// ExportSnapshot only reflects Watch results (remote nodes seen via etcd).
+// Self-node registration state is published separately via EventRegistrationChanged.
 type ExportSnapshot struct {
 	// Version is monotonically incremented on every atomic publish.
-	Version      uint64
-	PublishedAt  time.Time
+	Version     uint64
+	PublishedAt time.Time
 	// Cause identifies which sub-tree triggered this publish.
-	Cause        SnapshotCause
-	Discovery    DiscoverySetSnapshot
-	Topology     TopologySnapshot
-	Registration RegistrationSnapshot
+	Cause     SnapshotCause
+	Discovery DiscoverySetSnapshot
+	Topology  TopologySnapshot
 }
 
 // Empty returns true if the snapshot carries no meaningful data yet.

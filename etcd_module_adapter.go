@@ -714,8 +714,6 @@ func (m *etcdModuleAdapter) onSnapshotPublished(snap *modulev2.ExportSnapshot) {
 		m.diffDiscovery(prev, snap)
 	case modulev2.SnapshotCauseTopology:
 		m.diffTopology(prev, snap)
-	case modulev2.SnapshotCauseRegistration:
-		// Registration changes carry no node-level events for adapter consumers.
 	default: // SnapshotCauseReset or unknown
 		m.diffDiscovery(prev, snap)
 		m.diffTopology(prev, snap)

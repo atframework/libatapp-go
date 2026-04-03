@@ -6,10 +6,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/etcdversion"
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // ── ExportSnapshot ────────────────────────────────────────────────────────
@@ -25,7 +25,6 @@ func TestExportSnapshot_Empty(t *testing.T) {
 func TestExportSnapshot_Clone_Isolation(t *testing.T) {
 	node := &DiscoveryNode{Path: "/svc/a", Info: &pb.AtappDiscovery{Id: 1, Name: "svc-a"}}
 	tnode := &TopologyNode{Info: &pb.AtappTopologyInfo{Id: 10}}
-	reg := &pb.AtappDiscovery{Id: 99, Name: "reg"}
 
 	src := &ExportSnapshot{
 		Version:     7,
@@ -42,18 +41,10 @@ func TestExportSnapshot_Clone_Isolation(t *testing.T) {
 			LastRevision: 200,
 			NodesByID:    map[uint64]*TopologyNode{10: tnode},
 		},
-		Registration: RegistrationSnapshot{
-			LeaseID:    clientv3.LeaseID(42),
-			LeaseEpoch: 3,
-			ByPath:     map[string]*pb.AtappDiscovery{"/reg/a": reg},
-			ByName:     map[string]*pb.AtappDiscovery{"reg": reg},
-			ByID:       map[uint64]*pb.AtappDiscovery{99: reg},
-		},
 	}
 
 	dstDisc := src.Discovery.Clone()
 	dstTopo := src.Topology.Clone()
-	dstReg := src.Registration.Clone()
 
 	// --- structural parity ---
 	assert.Equal(t, src.Discovery.Ready, dstDisc.Ready)
@@ -66,12 +57,6 @@ func TestExportSnapshot_Clone_Isolation(t *testing.T) {
 	assert.Equal(t, src.Topology.LastRevision, dstTopo.LastRevision)
 	assert.Len(t, dstTopo.NodesByID, 1)
 
-	assert.Equal(t, src.Registration.LeaseID, dstReg.LeaseID)
-	assert.Equal(t, src.Registration.LeaseEpoch, dstReg.LeaseEpoch)
-	assert.Len(t, dstReg.ByPath, 1)
-	assert.Len(t, dstReg.ByName, 1)
-	assert.Len(t, dstReg.ByID, 1)
-
 	// --- isolation: adding to clone must not affect source ---
 	extra := &DiscoveryNode{Path: "/svc/z", Info: &pb.AtappDiscovery{Id: 99, Name: "svc-z"}}
 	dstDisc.NodesByPath["/svc/z"] = extra
@@ -79,9 +64,6 @@ func TestExportSnapshot_Clone_Isolation(t *testing.T) {
 
 	dstTopo.NodesByID[999] = &TopologyNode{Info: &pb.AtappTopologyInfo{Id: 999}}
 	assert.Len(t, src.Topology.NodesByID, 1, "source Topology.NodesByID must not grow")
-
-	dstReg.ByPath["/reg/z"] = &pb.AtappDiscovery{}
-	assert.Len(t, src.Registration.ByPath, 1, "source Registration.ByPath must not grow")
 }
 
 // TestExportSnapshot_NilClone verifies Clone on nil sub-snapshots returns empty
@@ -89,11 +71,9 @@ func TestExportSnapshot_Clone_Isolation(t *testing.T) {
 func TestExportSnapshot_NilClone(t *testing.T) {
 	var disc *DiscoverySetSnapshot
 	var topo *TopologySnapshot
-	var reg *RegistrationSnapshot
 
 	assert.NotNil(t, disc.Clone())
 	assert.NotNil(t, topo.Clone())
-	assert.NotNil(t, reg.Clone())
 }
 
 // ── DiscoverySetSnapshot – betterNodeForIndex ─────────────────────────────
@@ -253,13 +233,13 @@ func TestTopologySnapshot_RemoveNodeByID_Unknown(t *testing.T) {
 	assert.NotPanics(t, func() { s.RemoveNodeByID(999) })
 }
 
-// ── RegistrationSnapshot ─────────────────────────────────────────────────
+// ── SelfRegistrationSnapshot ─────────────────────────────────────────────
 
-// TestRegistrationSnapshot_Clone_Isolation verifies that the clone's maps are
+// TestSelfRegistrationSnapshot_Clone_Isolation verifies that the clone's maps are
 // independent of the source.
-func TestRegistrationSnapshot_Clone_Isolation(t *testing.T) {
+func TestSelfRegistrationSnapshot_Clone_Isolation(t *testing.T) {
 	disc := &pb.AtappDiscovery{Id: 1, Name: "svc"}
-	src := &RegistrationSnapshot{
+	src := &SelfRegistrationSnapshot{
 		LeaseID:    clientv3.LeaseID(7),
 		LeaseEpoch: 2,
 		ByPath:     map[string]*pb.AtappDiscovery{"/reg/a": disc},
@@ -282,9 +262,9 @@ func TestRegistrationSnapshot_Clone_Isolation(t *testing.T) {
 	assert.Len(t, src.ByPath, 1)
 }
 
-// TestRegistrationSnapshot_Clone_EmptyMapsAreNil verifies nil map semantics.
-func TestRegistrationSnapshot_Clone_EmptyMapsAreNil(t *testing.T) {
-	src := &RegistrationSnapshot{LeaseID: 5}
+// TestSelfRegistrationSnapshot_Clone_EmptyMapsAreNil verifies nil map semantics.
+func TestSelfRegistrationSnapshot_Clone_EmptyMapsAreNil(t *testing.T) {
+	src := &SelfRegistrationSnapshot{LeaseID: 5}
 	clone := src.Clone()
 	assert.Nil(t, clone.ByPath)
 	assert.Nil(t, clone.ByName)

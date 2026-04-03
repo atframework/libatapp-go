@@ -122,3 +122,93 @@ func TestEventBus_SubscribeType_WildcardZero_MatchesAll(t *testing.T) {
 
 	assert.Equal(t, 3, count)
 }
+
+// ── Sequence tests ────────────────────────────────────────────────────────
+
+func TestEventBus_Sequence_MonotonicallyIncreasing(t *testing.T) {
+	bus := runtime.NewEventBus()
+
+	var seqs []uint64
+	bus.Subscribe(func(e runtime.EventEnvelope) {
+		seqs = append(seqs, e.Sequence)
+	})
+
+	bus.Publish(makeEnv(1))
+	bus.Publish(makeEnv(2))
+	bus.Publish(makeEnv(3))
+
+	require.Len(t, seqs, 3)
+	assert.Less(t, seqs[0], seqs[1], "sequence must increase between publishes")
+	assert.Less(t, seqs[1], seqs[2], "sequence must increase between publishes")
+}
+
+func TestEventBus_Sequence_StartsAtOne(t *testing.T) {
+	bus := runtime.NewEventBus()
+
+	var first uint64
+	bus.Subscribe(func(e runtime.EventEnvelope) {
+		if first == 0 {
+			first = e.Sequence
+		}
+	})
+
+	bus.Publish(makeEnv(1))
+	assert.Equal(t, uint64(1), first)
+}
+
+func TestEventBus_Sequence_GlobalAcrossTypes(t *testing.T) {
+	// Sequence increments globally regardless of EventType — all events
+	// on the same bus share the same counter.
+	bus := runtime.NewEventBus()
+
+	var seqs []uint64
+	bus.Subscribe(func(e runtime.EventEnvelope) {
+		seqs = append(seqs, e.Sequence)
+	})
+
+	bus.Publish(makeEnv(1))
+	bus.Publish(makeEnv(5))
+	bus.Publish(makeEnv(9))
+
+	require.Len(t, seqs, 3)
+	// Sequences must be distinct and ordered.
+	assert.Equal(t, seqs[0]+1, seqs[1])
+	assert.Equal(t, seqs[1]+1, seqs[2])
+}
+
+func TestEventBus_Sequence_NotAssignedOnNilPublish(t *testing.T) {
+	// A caller that constructs an envelope and never publishes it should
+	// retain Sequence == 0 (the zero value).
+	env := makeEnv(1)
+	assert.Equal(t, uint64(0), env.Sequence)
+}
+
+func TestEventBus_Sequence_ConcurrentPublish_AllUnique(t *testing.T) {
+	bus := runtime.NewEventBus()
+
+	const workers = 8
+	const perWorker = 50
+
+	var mu sync.Mutex
+	seen := make(map[uint64]struct{}, workers*perWorker)
+
+	bus.Subscribe(func(e runtime.EventEnvelope) {
+		mu.Lock()
+		seen[e.Sequence] = struct{}{}
+		mu.Unlock()
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				bus.Publish(makeEnv(1))
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, workers*perWorker, len(seen), "every published event must have a unique Sequence")
+}

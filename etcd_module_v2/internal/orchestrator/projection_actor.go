@@ -80,7 +80,6 @@ type ProjectionActor struct {
 
 	// pending tracks accepted-but-not-yet-merged Registration epochs so we
 	// don't regress the snapshot on out-of-order delivery.
-	currentLeaseEpoch uint64
 
 	// version monotonically incremented on each publish.
 	version uint64
@@ -95,7 +94,6 @@ type ProjectionActor struct {
 	// internal mutable sub-state (only touched in Run goroutine)
 	discovery snapshot.DiscoverySetSnapshot
 	topology  snapshot.TopologySnapshot
-	reg       snapshot.RegistrationSnapshot
 }
 
 // NewProjectionActor creates a ProjectionActor.  onPublish may be nil.
@@ -163,30 +161,6 @@ func (a *ProjectionActor) onApply(env runtime.EventEnvelope) {
 	}
 
 	switch env.Type {
-	// ── Lease events ────────────────────────────────────────────────────
-	case runtime.EventLeaseExpired:
-		a.reg = snapshot.RegistrationSnapshot{}
-		a.currentLeaseEpoch = env.LeaseEpoch
-		a.publishSnapshot(snapshot.SnapshotCauseRegistration)
-
-	case runtime.EventLeaseGranted:
-		a.currentLeaseEpoch = env.LeaseEpoch
-
-	case runtime.EventLeaseReleased:
-		a.reg = snapshot.RegistrationSnapshot{}
-		a.publishSnapshot(snapshot.SnapshotCauseRegistration)
-
-	// ── Registration events ─────────────────────────────────────────────
-	case runtime.EventRegistrationChanged:
-		// Discard stale-epoch registrations to prevent regression.
-		if env.LeaseEpoch < a.currentLeaseEpoch {
-			return
-		}
-		pl := env.Payload.(RegistrationChangedPayload)
-		a.reg = *pl.RegistrationSnapshot.Clone()
-		a.currentLeaseEpoch = env.LeaseEpoch
-		a.publishSnapshot(snapshot.SnapshotCauseRegistration)
-
 	// ── Watch events ─────────────────────────────────────────────────────
 	case runtime.EventWatchSnapshotLoading:
 		// Mark this prefix as loading and evict its stale nodes.
@@ -293,7 +267,6 @@ func (a *ProjectionActor) onReset() {
 	a.topology = snapshot.TopologySnapshot{
 		NodesByID: make(map[uint64]*snapshot.TopologyNode),
 	}
-	a.reg = snapshot.RegistrationSnapshot{}
 	a.dedupeCache = make(map[string]struct{})
 	a.discLoadingPrefixes = make(map[string]struct{})
 	a.publishSnapshot(snapshot.SnapshotCauseReset)
@@ -304,15 +277,21 @@ func (a *ProjectionActor) onReset() {
 func (a *ProjectionActor) publishSnapshot(cause snapshot.SnapshotCause) {
 	a.version++
 	snap := &snapshot.ExportSnapshot{
-		Version:      a.version,
-		PublishedAt:  time.Now(),
-		Cause:        cause,
-		Discovery:    *a.discovery.Clone(),
-		Topology:     *a.topology.Clone(),
-		Registration: *a.reg.Clone(),
+		Version:     a.version,
+		PublishedAt: time.Now(),
+		Cause:       cause,
+		Discovery:   *a.discovery.Clone(),
+		Topology:    *a.topology.Clone(),
 	}
+	// atomic.Store 必须先于 EventBus.Publish：订阅者在收到
+	// EventProjectionSnapshotUpdated 时调用 GetSnapshot() 必然能看到新快照。
 	a.snapshot.Store(snap)
 	if a.onPublish != nil {
 		a.onPublish(snap)
 	}
+	a.eventBus.Publish(runtime.EventEnvelope{
+		Type:    runtime.EventProjectionSnapshotUpdated,
+		Source:  runtime.EventSourceProjectionActor,
+		Payload: snap,
+	})
 }

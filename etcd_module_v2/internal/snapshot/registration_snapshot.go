@@ -10,27 +10,30 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// RegistrationSnapshot is the Registration sub-view within ExportSnapshot.
-// It mirrors the current state of all services that have been successfully
-// written to etcd by RegistrationActor.
+// SelfRegistrationSnapshot is the self-node registration sub-view within ExportSnapshot.
+// It mirrors the write-side state: services that this node has successfully
+// written to etcd via RegistrationActor (bypath/byname/byid/topology).
+// It is distinct from DiscoverySetSnapshot / TopologySnapshot, which are
+// read-side views of remote nodes discovered via WatchActor.
 //
 // All maps are immutable after construction (copy-on-write semantics).
-type RegistrationSnapshot struct {
-	LeaseID   clientv3.LeaseID
-	LeaseEpoch uint64
-	ByPath    map[string]*pb.AtappDiscovery
-	ByName    map[string]*pb.AtappDiscovery
-	ByID      map[uint64]*pb.AtappDiscovery
-	UpdatedAt time.Time
+type SelfRegistrationSnapshot struct {
+	LeaseID          clientv3.LeaseID
+	LeaseEpoch       uint64
+	ByPath           map[string]*pb.AtappDiscovery
+	ByName           map[string]*pb.AtappDiscovery
+	ByID             map[uint64]*pb.AtappDiscovery
+	TopologyServices map[string]*pb.AtappTopologyInfo // key = etcd topology key (topologyPrefix/name-id)
+	UpdatedAt        time.Time
 }
 
 // Clone returns a shallow copy whose maps point to the same underlying
 // *pb.AtappDiscovery values (safe because those are treated as immutable).
-func (s *RegistrationSnapshot) Clone() *RegistrationSnapshot {
+func (s *SelfRegistrationSnapshot) Clone() *SelfRegistrationSnapshot {
 	if s == nil {
-		return &RegistrationSnapshot{}
+		return &SelfRegistrationSnapshot{}
 	}
-	out := &RegistrationSnapshot{
+	out := &SelfRegistrationSnapshot{
 		LeaseID:    s.LeaseID,
 		LeaseEpoch: s.LeaseEpoch,
 		UpdatedAt:  s.UpdatedAt,
@@ -51,6 +54,12 @@ func (s *RegistrationSnapshot) Clone() *RegistrationSnapshot {
 		out.ByID = make(map[uint64]*pb.AtappDiscovery, len(s.ByID))
 		for k, v := range s.ByID {
 			out.ByID[k] = v
+		}
+	}
+	if len(s.TopologyServices) > 0 {
+		out.TopologyServices = make(map[string]*pb.AtappTopologyInfo, len(s.TopologyServices))
+		for k, v := range s.TopologyServices {
+			out.TopologyServices[k] = v
 		}
 	}
 	return out

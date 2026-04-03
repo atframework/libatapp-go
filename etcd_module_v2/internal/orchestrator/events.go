@@ -31,7 +31,7 @@ type LeaseReleasedPayload struct {
 // RegistrationChangedPayload is the Payload carried by EventRegistrationChanged.
 // The maps are immutable after the envelope is published.
 type RegistrationChangedPayload struct {
-	snapshot.RegistrationSnapshot
+	snapshot.SelfRegistrationSnapshot
 }
 
 // WatchNodePayload is shared by EventWatchNodeUp, Down, and Update.

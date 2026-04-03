@@ -49,10 +49,9 @@ type DataVersion = etcdversion.DataVersion
 type SnapshotCause = snapshot.SnapshotCause
 
 const (
-	SnapshotCauseReset        = snapshot.SnapshotCauseReset
-	SnapshotCauseDiscovery    = snapshot.SnapshotCauseDiscovery
-	SnapshotCauseTopology     = snapshot.SnapshotCauseTopology
-	SnapshotCauseRegistration = snapshot.SnapshotCauseRegistration
+	SnapshotCauseReset     = snapshot.SnapshotCauseReset
+	SnapshotCauseDiscovery = snapshot.SnapshotCauseDiscovery
+	SnapshotCauseTopology  = snapshot.SnapshotCauseTopology
 )
 
 // ── Watcher callback types ────────────────────────────────────────────────
@@ -98,15 +97,7 @@ type PathConfig struct {
 	// ByIDPrefix is the prefix for ID-indexed service keys.
 	// e.g. "/services/id/"
 	ByIDPrefix string
-	// ByTypeIDPrefix is the prefix for type-id-indexed service keys.
-	// e.g. "/services/by_type_id/"
-	ByTypeIDPrefix string
-	// ByTypeNamePrefix is the prefix for type-name-indexed service keys.
-	// e.g. "/services/by_type_name/"
-	ByTypeNamePrefix string
-	// ByTagPrefix is the prefix for tag-indexed service keys.
-	// e.g. "/services/by_tag/"
-	ByTagPrefix string
+
 	// TopologyPrefix is the prefix for topology keepalive keys.
 	// e.g. "/topology/"
 	TopologyPrefix string

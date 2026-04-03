@@ -95,8 +95,6 @@ type LeaseActor struct {
 	etcdClient EtcdClient
 	eventBus   runtime.EventBus
 
-	// seq is used strictly inside the Run goroutine.
-
 	// kaCancel cancels the active keepalive goroutine; only set while phase==active.
 	// Stored as atomic so the keepalive goroutine can read it safely.
 	kaCancel atomic.Pointer[context.CancelFunc]

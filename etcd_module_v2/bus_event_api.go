@@ -60,6 +60,11 @@ const (
 
 	// EventRegistrationChanged fires when the registration index is updated.
 	EventRegistrationChanged EventType = runtime.EventRegistrationChanged
+
+	// EventProjectionSnapshotUpdated fires after ProjectionActor atomically
+	// stores a new ExportSnapshot.  Published from the ProjectionActor mailbox
+	// goroutine, so receivers may call GetSnapshot() immediately.
+	EventProjectionSnapshotUpdated EventType = runtime.EventProjectionSnapshotUpdated
 )
 
 // EventTypeName returns a human-readable name for the given EventType.
