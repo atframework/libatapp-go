@@ -123,15 +123,18 @@ func (regMsgReplayTopology) regMsgKind()  {}
 
 // discoveryRegistrationEntry tracks desired/actual state for discovery paths.
 type discoveryRegistrationEntry struct {
-	info       *pb.AtappDiscovery
-	path       string // etcd write path (by-path key; by-name/id derived from info)
-	ttl        int64
-	desired    bool // the operator wants this service registered
-	registered bool // successfully written to etcd in current lease epoch
-	stale      bool // lease expired; needs replaying
-	retryCount int
-	lastError  error
-	updatedAt  time.Time
+	info         *pb.AtappDiscovery
+	path         string // etcd write path (by-path key; by-name/id derived from info)
+	ttl          int64
+	desired      bool // the operator wants this service registered
+	registered   bool // successfully written to etcd in current lease epoch
+	stale        bool // lease expired; needs replaying
+	retryCount   int
+	lastError    error
+	updatedAt    time.Time
+	// pendingReply is non-nil when AddDiscovery was called before a lease existed.
+	// The first definitive write result (success or error) drains and clears it.
+	pendingReply chan<- error
 }
 
 func (e *discoveryRegistrationEntry) markRegistered() {
@@ -156,15 +159,17 @@ func (e *discoveryRegistrationEntry) markExpired() {
 
 // topologyRegistrationEntry tracks desired/actual state for topology keepalive keys.
 type topologyRegistrationEntry struct {
-	info       *pb.AtappTopologyInfo
-	key        string
-	ttl        int64
-	desired    bool
-	registered bool
-	stale      bool
-	retryCount int
-	lastError  error
-	updatedAt  time.Time
+	info         *pb.AtappTopologyInfo
+	key          string
+	ttl          int64
+	desired      bool
+	registered   bool
+	stale        bool
+	retryCount   int
+	lastError    error
+	updatedAt    time.Time
+	// pendingReply is non-nil when AddTopology was called before a lease existed.
+	pendingReply chan<- error
 }
 
 func (e *topologyRegistrationEntry) markRegistered() {
@@ -341,6 +346,28 @@ func (a *RegistrationActor) Run(ctx context.Context) {
 	defer a.eventBus.Unsubscribe(hLease)
 
 	a.RunLoop(ctx, a.handle)
+
+	// Drain any pending replies that were deferred waiting for a lease.
+	// If the actor stops before a lease was ever granted, callers blocked on
+	// AddDiscovery/AddTopology would leak forever without this.
+	stopErr := ctx.Err()
+	if stopErr == nil {
+		stopErr = errors.New("registration actor stopped")
+	}
+	for key, svc := range a.st.discoveryServices {
+		if svc.pendingReply != nil {
+			svc.pendingReply <- stopErr
+			svc.pendingReply = nil
+			a.st.discoveryServices[key] = svc
+		}
+	}
+	for key, svc := range a.st.topologyServices {
+		if svc.pendingReply != nil {
+			svc.pendingReply <- stopErr
+			svc.pendingReply = nil
+			a.st.topologyServices[key] = svc
+		}
+	}
 }
 
 // ── Message handlers ──────────────────────────────────────────────────────
@@ -419,6 +446,10 @@ func (a *RegistrationActor) onAddDiscovery(msg regMsgAddDiscovery) {
 		a.st.discoveryServices = make(map[string]discoveryRegistrationEntry)
 	}
 
+	// Detect 0→1 transition to emit EventRegistrationRequested.
+	// Use map lengths: by invariant all entries in the maps are desired=true.
+	wasEmpty := len(a.st.discoveryServices) == 0 && len(a.st.topologyServices) == 0
+
 	discoveryEntry := discoveryRegistrationEntry{
 		info:    cloneDiscoveryInfo(msg.Info),
 		path:    msg.Path,
@@ -428,10 +459,16 @@ func (a *RegistrationActor) onAddDiscovery(msg regMsgAddDiscovery) {
 	}
 	a.st.discoveryServices[msg.Path] = discoveryEntry
 
+	if wasEmpty {
+		a.publishRegistrationRequested()
+	}
+
 	if a.st.leaseID == 0 {
-		// No active lease yet; reply success (write will happen after LeaseGranted).
+		// No active lease yet; defer the reply until the first real etcd write.
+		// onReplayDiscovery will drain pendingReply once the lease is granted.
 		if msg.Reply != nil {
-			msg.Reply <- nil
+			discoveryEntry.pendingReply = msg.Reply
+			a.st.discoveryServices[msg.Path] = discoveryEntry
 		}
 		return
 	}
@@ -469,6 +506,10 @@ func (a *RegistrationActor) onAddTopology(msg regMsgAddTopology) {
 		return
 	}
 
+	// Detect 0→1 transition to emit EventRegistrationRequested.
+	// Use map lengths: by invariant all entries in the maps are desired=true.
+	wasEmpty := len(a.st.discoveryServices) == 0 && len(a.st.topologyServices) == 0
+
 	topologyEntry := topologyRegistrationEntry{
 		info:    topologyInfo,
 		key:     topologyKey,
@@ -481,9 +522,15 @@ func (a *RegistrationActor) onAddTopology(msg regMsgAddTopology) {
 		a.st.serviceTopologyKey[msg.ServicePath] = topologyKey
 	}
 
+	if wasEmpty {
+		a.publishRegistrationRequested()
+	}
+
 	if a.st.leaseID == 0 {
+		// No active lease yet; defer the reply until the first real etcd write.
 		if msg.Reply != nil {
-			msg.Reply <- nil
+			topologyEntry.pendingReply = msg.Reply
+			a.st.topologyServices[topologyKey] = topologyEntry
 		}
 		return
 	}
@@ -513,15 +560,12 @@ func (a *RegistrationActor) onRemoveService(msg regMsgRemoveService) {
 		}
 		return
 	}
-	discoveryEntry.desired = false
-	a.st.discoveryServices[msg.Path] = discoveryEntry
 
 	topologyKey := a.st.serviceTopologyKey[msg.Path]
+
 	var topologyEntry topologyRegistrationEntry
 	if topologyKey != "" {
 		topologyEntry = a.st.topologyServices[topologyKey]
-		topologyEntry.desired = false
-		a.st.topologyServices[topologyKey] = topologyEntry
 	}
 
 	if a.st.leaseID != 0 {
@@ -537,7 +581,17 @@ func (a *RegistrationActor) onRemoveService(msg regMsgRemoveService) {
 		delete(a.st.topologyServices, topologyKey)
 	}
 	delete(a.st.serviceTopologyKey, msg.Path)
+	// Drain any pending replies from AddDiscovery/AddTopology that never got a lease.
+	if discoveryEntry.pendingReply != nil {
+		discoveryEntry.pendingReply <- nil
+	}
+	if topologyKey != "" && topologyEntry.pendingReply != nil {
+		topologyEntry.pendingReply <- nil
+	}
 	a.publishRegistrationChanged()
+	if len(a.st.discoveryServices) == 0 && len(a.st.topologyServices) == 0 {
+		a.publishRegistrationEmpty()
+	}
 	if msg.Reply != nil {
 		msg.Reply <- nil
 	}
@@ -589,6 +643,11 @@ func (a *RegistrationActor) onReplayDiscovery(msg regMsgReplayDiscovery) {
 			"retry", svc.retryCount,
 			"err", err)
 		svc.markFailed(err)
+		// Reply to any pending AddDiscovery waiter on first write failure.
+		if svc.pendingReply != nil {
+			svc.pendingReply <- err
+			svc.pendingReply = nil
+		}
 		a.st.discoveryServices[msg.ServiceKey] = svc
 		// Schedule an exponential-backoff retry; the epoch guard above ensures
 		// that delayed messages from a dead lease are silently dropped.
@@ -601,6 +660,11 @@ func (a *RegistrationActor) onReplayDiscovery(msg regMsgReplayDiscovery) {
 		return
 	}
 	svc.markRegistered()
+	// Reply to any pending AddDiscovery waiter on first successful write.
+	if svc.pendingReply != nil {
+		svc.pendingReply <- nil
+		svc.pendingReply = nil
+	}
 	a.st.discoveryServices[msg.ServiceKey] = svc
 	if a.st.pendingReplayCount > 0 {
 		a.st.pendingReplayCount--
@@ -625,6 +689,11 @@ func (a *RegistrationActor) onReplayTopology(msg regMsgReplayTopology) {
 			"retry", svc.retryCount,
 			"err", err)
 		svc.markFailed(err)
+		// Reply to any pending AddTopology waiter on first write failure.
+		if svc.pendingReply != nil {
+			svc.pendingReply <- err
+			svc.pendingReply = nil
+		}
 		a.st.topologyServices[msg.TopologyKey] = svc
 		delay := backoffDuration(svc.retryCount)
 		leaseEpoch := a.st.leaseEpoch
@@ -635,6 +704,11 @@ func (a *RegistrationActor) onReplayTopology(msg regMsgReplayTopology) {
 		return
 	}
 	svc.markRegistered()
+	// Reply to any pending AddTopology waiter on first successful write.
+	if svc.pendingReply != nil {
+		svc.pendingReply <- nil
+		svc.pendingReply = nil
+	}
 	a.st.topologyServices[msg.TopologyKey] = svc
 	if a.st.pendingReplayCount > 0 {
 		a.st.pendingReplayCount--
@@ -832,5 +906,27 @@ func (a *RegistrationActor) publishRegistrationChanged() {
 		LeaseEpoch: a.st.leaseEpoch,
 		OccurredAt: time.Now(),
 		Payload:    RegistrationChangedPayload{SelfRegistrationSnapshot: snap},
+	})
+}
+
+func (a *RegistrationActor) publishRegistrationRequested() {
+	a.eventBus.Publish(runtime.EventEnvelope{
+		Type:       runtime.EventRegistrationRequested,
+		Version:    1,
+		Source:     runtime.EventSourceRegistrationActor,
+		LeaseEpoch: a.st.leaseEpoch,
+		OccurredAt: time.Now(),
+		Payload:    RegistrationRequestedPayload{},
+	})
+}
+
+func (a *RegistrationActor) publishRegistrationEmpty() {
+	a.eventBus.Publish(runtime.EventEnvelope{
+		Type:       runtime.EventRegistrationEmpty,
+		Version:    1,
+		Source:     runtime.EventSourceRegistrationActor,
+		LeaseEpoch: a.st.leaseEpoch,
+		OccurredAt: time.Now(),
+		Payload:    RegistrationEmptyPayload{},
 	})
 }

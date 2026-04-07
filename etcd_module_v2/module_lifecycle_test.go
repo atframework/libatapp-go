@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	pb "github.com/atframework/libatapp-go/protocol/atframe"
 )
 
 // ── Mock EtcdClient for testing ───────────────────────────────────────────
@@ -147,9 +149,18 @@ func TestEtcdModule_Stop_NilCancelFuncDoesNotPanic(t *testing.T) {
 // ── Test: Stop with lease revoke error ────────────────────────────────────
 
 // TestEtcdModule_Stop_LeaseRevokeError verifies that lease revocation errors
-// are captured and returned, allowing the caller to see what went wrong.
+// are captured and returned.  A service is registered first to trigger lazy
+// lease acquisition; then Stop() must propagate the revoke failure.
 func TestEtcdModule_Stop_LeaseRevokeError(t *testing.T) {
+	grantSeen := make(chan struct{}, 1)
 	mockClient := &testMockEtcdClient{
+		grantFn: func(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
+			select {
+			case grantSeen <- struct{}{}:
+			default:
+			}
+			return &clientv3.LeaseGrantResponse{ID: 999, TTL: ttl}, nil
+		},
 		revokeFn: func(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
 			return nil, errors.New("simulated revoke error")
 		},
@@ -161,17 +172,28 @@ func TestEtcdModule_Stop_LeaseRevokeError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Start the module normally.
 	err := module.Start(ctx)
 	require.NoError(t, err)
 
-	// Call Stop – should capture and return the lease error.
-	stopErr := module.Stop(ctx)
+	// Trigger lazy lease acquisition via a registration request.
+	_, err = module.RegisterService(ctx, ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: 1, Name: "revoke-test-svc"},
+		Path:      cfg.ByIDPrefix + "/revoke-test-1",
+		TTL:       10,
+	})
+	require.NoError(t, err)
 
-	// Verify that the error message contains information about the lease revoke failure.
-	if stopErr != nil {
-		assert.Contains(t, stopErr.Error(), "lease revoke error")
+	// Wait for the lease to be granted before stopping.
+	select {
+	case <-grantSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("lease was not granted within timeout")
 	}
+
+	// Stop — must capture the revoke error.
+	stopErr := module.Stop(ctx)
+	require.Error(t, stopErr)
+	assert.Contains(t, stopErr.Error(), "lease revoke error")
 }
 
 // ── Test: Stop with context timeout ──────────────────────────────────────

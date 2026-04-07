@@ -44,9 +44,9 @@ import (
 // ── actor test fixture prefixes ───────────────────────────────────────────
 
 const (
-	actorIntegByIDPrefix    = "/svc/by_id"
-	actorIntegByNamePrefix  = "/svc/by_name"
-	actorIntegTopoPrefix    = "/svc/topology"
+	actorIntegByIDPrefix   = "/svc/by_id"
+	actorIntegByNamePrefix = "/svc/by_name"
+	actorIntegTopoPrefix   = "/svc/topology"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -135,22 +135,96 @@ func waitForActorIntegEvent(
 
 // ── LeaseActor integration tests ──────────────────────────────────────────
 
-// TestModule_Lease_GrantedOnStart corresponds to TestLeaseActor_StartGrantsLease.
-// It verifies that module.Start() makes the facade publish EventLeaseGranted on
-// its event bus, observable via module.Subscribe.
-func TestModule_Lease_GrantedOnStart(t *testing.T) {
+// TestModule_Lease_GrantedOnFirstRegister verifies the lazy-start behaviour:
+// EventLeaseGranted is NOT published on module.Start(), but IS published once
+// the first RegisterService call drives EventRegistrationRequested on the EventBus,
+// which LeaseActor handles by acquiring a lease.
+//
+// This corresponds to TestLeaseActor_StartGrantsLease in unit tests.
+func TestModule_Lease_GrantedOnFirstRegister(t *testing.T) {
 	m := startActorIntegModule(t, nil)
 	ch := subscribeActorIntegEvents(t, m)
 
-	// The LeaseActor has already been started inside module.Start(); the grant
-	// event may come very quickly.  Use a generous timeout for slow CI.
-	env := waitForActorIntegEvent(t, ch, modulev2.EventLeaseGranted, 5*time.Second)
+	// Lease must NOT be granted before any registration request.
+	require.Never(t, func() bool {
+		select {
+		case env := <-ch:
+			return env.Type == modulev2.EventLeaseGranted
+		default:
+			return false
+		}
+	}, 150*time.Millisecond, 20*time.Millisecond,
+		"lease must not be granted before the first RegisterService call")
 
+	// Trigger lazy lease acquisition via the first registration.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := m.RegisterService(ctx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: 1, Name: "lazy-lease-svc"},
+		Path:      actorIntegByIDPrefix + "/lazy-lease-1",
+		TTL:       10,
+	})
+	require.NoError(t, err)
+
+	// Now EventLeaseGranted must arrive.
+	env := waitForActorIntegEvent(t, ch, modulev2.EventLeaseGranted, 5*time.Second)
 	pl, ok := env.Payload.(modulev2.LeaseGrantedPayload)
 	require.True(t, ok, "payload must be LeaseGrantedPayload")
-	// mock/mockserver returns LeaseID=0; assert only that the event fired.
 	_ = pl
 	assert.Equal(t, uint64(1), env.LeaseEpoch, "first lease grant must have epoch=1")
+}
+
+// TestModule_Lease_StopsOnLastUnregister verifies that when the last registered
+// service is removed, EventRegistrationEmpty drives LeaseActor to revoke the
+// lease (pendingStop level-triggered flag) and the actor returns to idle state.
+//
+// After the stop, a new RegisterService triggers a fresh lease grant (epoch=1
+// because onStop resets the state).  This proves the lease lifecycle correctly
+// ties to registration presence.
+func TestModule_Lease_StopsOnLastUnregister(t *testing.T) {
+	m := startActorIntegModule(t, nil)
+	ch := subscribeActorIntegEvents(t, m)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	svcPath := actorIntegByIDPrefix + "/lease-stop-901"
+
+	// Register — triggers EventRegistrationRequested → lease acquisition.
+	_, err := m.RegisterService(ctx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: 901, Name: "lease-stop-svc"},
+		Path:      svcPath,
+		TTL:       10,
+	})
+	require.NoError(t, err)
+	waitForActorIntegEvent(t, ch, modulev2.EventLeaseGranted, 5*time.Second) // epoch=1
+
+	// Unregister the last service — triggers EventRegistrationEmpty → lease stop.
+	err = m.UnregisterService(ctx, svcPath)
+	require.NoError(t, err)
+
+	// After the internal stop, the LeaseActor is idle: Tick must NOT produce a new grant.
+	// Wait long enough (>RetryInterval=100ms) for any Tick to have fired.
+	require.Never(t, func() bool {
+		select {
+		case env := <-ch:
+			return env.Type == modulev2.EventLeaseGranted
+		default:
+			return false
+		}
+	}, 300*time.Millisecond, 20*time.Millisecond,
+		"no lease grant must occur while no services are registered")
+
+	// Re-register — drives a new EventRegistrationRequested → fresh lease.
+	_, err = m.RegisterService(ctx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: 902, Name: "lease-stop-svc-2"},
+		Path:      actorIntegByIDPrefix + "/lease-stop-902",
+		TTL:       10,
+	})
+	require.NoError(t, err)
+	env := waitForActorIntegEvent(t, ch, modulev2.EventLeaseGranted, 5*time.Second)
+	// leaseEpoch resets to 1 because onStop resets the full leaseState.
+	assert.Equal(t, uint64(1), env.LeaseEpoch, "fresh lease after re-registration must have epoch=1")
 }
 
 // TestModule_Lifecycle_StopModuleCleanly corresponds to
@@ -210,7 +284,11 @@ func TestModule_RegisterService_FiresRegistrationChanged(t *testing.T) {
 
 	handle, err := m.RegisterService(ctx, svc)
 	require.NoError(t, err)
-	_ = handle.Wait(ctx)
+	// handle.Wait intentionally not called: this test only verifies that
+	// onRemoveService always publishes EventRegistrationChanged.  The
+	// AddDiscovery and RemoveService messages are processed in FIFO mailbox
+	// order, so RemoveService is guaranteed to execute after AddDiscovery.
+	_ = handle
 
 	// Unregister triggers onRemoveDiscovery which always publishes
 	// EventRegistrationChanged (the bus-delivery path we want to exercise).
@@ -295,7 +373,12 @@ func TestModule_StopAndNewModuleStart_RegrantsLease(t *testing.T) {
 	cli1, err := clientv3.New(clientv3.Config{Endpoints: []string{addr}, DialTimeout: 5 * time.Second})
 	require.NoError(t, err)
 
-	cfg := modulev2.PathConfig{ByIDPrefix: actorIntegByIDPrefix, LeaseTTL: 30}
+	cfg := modulev2.PathConfig{
+		ByIDPrefix:     actorIntegByIDPrefix,
+		ByNamePrefix:   actorIntegByNamePrefix,
+		TopologyPrefix: actorIntegTopoPrefix,
+		LeaseTTL:       30,
+	}
 	m1 := modulev2.NewEtcdModule(cli1, cfg, modulev2.ModuleOptions{RetryInterval: 100 * time.Millisecond})
 	require.NoError(t, m1.Start(context.Background()))
 
@@ -305,6 +388,15 @@ func TestModule_StopAndNewModuleStart_RegrantsLease(t *testing.T) {
 		case ch1 <- e:
 		default:
 		}
+	})
+
+	// Trigger lazy lease acquisition via a registration request.
+	regCtx1, regCancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer regCancel1()
+	_, _ = m1.RegisterService(regCtx1, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: 1, Name: "reload-svc"},
+		Path:      actorIntegByIDPrefix + "/reload-svc-1",
+		TTL:       10,
 	})
 
 	waitForActorIntegEvent(t, ch1, modulev2.EventLeaseGranted, 5*time.Second)
@@ -332,6 +424,15 @@ func TestModule_StopAndNewModuleStart_RegrantsLease(t *testing.T) {
 		case ch2 <- e:
 		default:
 		}
+	})
+
+	// Trigger lazy lease acquisition on the second module instance.
+	regCtx2, regCancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer regCancel2()
+	_, _ = m2.RegisterService(regCtx2, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: 2, Name: "reload-svc-2"},
+		Path:      actorIntegByIDPrefix + "/reload-svc-2",
+		TTL:       10,
 	})
 
 	// The new instance must re-acquire a lease independently.

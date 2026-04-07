@@ -36,6 +36,12 @@ const (
 	// atomic.Store 完成后发布。订阅者收到此事件时可直接调用 GetSnapshot()，
 	// 无需额外轮询。
 	EventProjectionSnapshotUpdated // 15
+
+	// Registration lifecycle control events.
+	// Internal actor-to-actor signals: RegistrationActor → LeaseActor.
+	// Do NOT expose at the EtcdModule facade level.
+	EventRegistrationRequested // 16 — first desired service added; drives LeaseActor to start
+	EventRegistrationEmpty     // 17 — all desired services removed; drives LeaseActor to stop
 )
 
 // EventTypeName returns a human-readable label for the given EventType.
@@ -74,6 +80,10 @@ func EventTypeName(t EventType) string {
 		return "watch.topology.snapshot.loaded"
 	case EventProjectionSnapshotUpdated:
 		return "projection.snapshot.updated"
+	case EventRegistrationRequested:
+		return "registration.requested"
+	case EventRegistrationEmpty:
+		return "registration.empty"
 	default:
 		return fmt.Sprintf("EventType(%d)", uint32(t))
 	}

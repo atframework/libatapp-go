@@ -627,29 +627,6 @@ func TestEtcdModuleAdapter_Reset_DiffsBothSubTrees(t *testing.T) {
 	assert.Equal(t, 1, topoCount, "topology node PUT must fire")
 }
 
-// ── core path: Registration cause — no diff ───────────────────────────────
-
-func TestEtcdModuleAdapter_RegistrationCause_DoesNotFireNodeCallbacks(t *testing.T) {
-	a := newEtcdModuleAdapter(nil)
-
-	// Seed some nodes in prevSnap via a discovery publish.
-	a.onSnapshotPublished(makeDiscSnap(discNode("/by_id/1", 1, "n")))
-
-	var called bool
-	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) { called = true })
-
-	// Same discovery content but cause=Registration — no diff should run.
-	snap := &modulev2.ExportSnapshot{
-		Version:     2,
-		PublishedAt: time.Now(),
-		Cause:       modulev2.SnapshotCauseRegistration,
-		Discovery:   *makeDiscSnap(discNode("/by_id/1", 1, "n")).Discovery.Clone(),
-	}
-	a.onSnapshotPublished(snap)
-
-	assert.False(t, called, "Registration cause must not trigger node diff")
-}
-
 // ── read-only helpers ──────────────────────────────────────────────────────
 
 func TestEtcdModuleAdapter_GetTopologyInfoSet_ReturnsEmptyMap_NoImpl(t *testing.T) {

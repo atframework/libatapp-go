@@ -155,27 +155,40 @@ func (m *etcdModuleAdapter) startImpl(ctx context.Context, impl *modulev2.EtcdMo
 	if err := impl.Start(ctx); err != nil {
 		return err
 	}
-	m.replayRegistrations(ctx, impl)
-	return nil
+
+	return m.replayRegistrations(ctx, impl)
 }
 
-// replayRegistrations re-submits every cached ServiceInfo to impl.
+// replayRegistrations re-submits every cached ServiceInfo to impl and waits
+// for all writes to complete (or ctx to expire).
 // Call after impl.Start to restore registrations lost when the actor restarts.
 // Must be called with m.mu NOT held.
-func (m *etcdModuleAdapter) replayRegistrations(ctx context.Context, impl *modulev2.EtcdModule) {
+func (m *etcdModuleAdapter) replayRegistrations(ctx context.Context, impl *modulev2.EtcdModule) error {
 	m.mu.RLock()
 	if len(m.registrations) == 0 {
 		m.mu.RUnlock()
-		return
+		return nil
 	}
 	svcs := make([]modulev2.ServiceInfo, 0, len(m.registrations))
 	for _, svc := range m.registrations {
 		svcs = append(svcs, svc)
 	}
 	m.mu.RUnlock()
+
+	handles := make([]*modulev2.RegistrationHandle, 0, len(svcs))
 	for _, svc := range svcs {
-		_, _ = impl.RegisterService(ctx, svc)
+		h, err := impl.RegisterService(ctx, svc)
+		if err != nil {
+			continue
+		}
+		handles = append(handles, h)
 	}
+	for _, h := range handles {
+		if err := h.Wait(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *etcdModuleAdapter) Reload() error {
@@ -210,7 +223,10 @@ func (m *etcdModuleAdapter) Reload() error {
 		return nil
 	}
 	if newHosts := newEtcdCfg.GetHosts(); len(newHosts) > 0 {
-		_ = impl.UpdateEndpoints(newHosts)
+		err := impl.UpdateEndpoints(newHosts)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -232,7 +248,10 @@ func (m *etcdModuleAdapter) hardReload() error {
 	if impl != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stopCancel()
-		_ = impl.Stop(stopCtx)
+		err := impl.Stop(stopCtx)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Re-create from current config (no-op when there is no owner or the
@@ -452,7 +471,11 @@ func (m *etcdModuleAdapter) AddRegistrationDiscoveryActor(val *pb.AtappDiscovery
 	if impl == nil {
 		return nil
 	}
-	if _, err := impl.RegisterService(context.Background(), svc); err != nil {
+	h, err := impl.RegisterService(context.Background(), svc)
+	if err != nil {
+		return nil
+	}
+	if err = h.Wait(context.Background()); err != nil {
 		return nil
 	}
 	return &EtcdRegistration{path: nodePath}
@@ -472,7 +495,11 @@ func (m *etcdModuleAdapter) AddRegistrationTopologyActor(val *pb.AtappTopologyIn
 	if impl == nil {
 		return nil
 	}
-	if _, err := impl.RegisterService(context.Background(), svc); err != nil {
+	h, err := impl.RegisterService(context.Background(), svc)
+	if err != nil {
+		return nil
+	}
+	if err = h.Wait(context.Background()); err != nil {
 		return nil
 	}
 	return &EtcdRegistration{path: nodePath}

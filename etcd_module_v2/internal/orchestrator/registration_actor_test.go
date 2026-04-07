@@ -132,13 +132,16 @@ func grantLeaseAndWait(t *testing.T, actor *RegistrationActor, client *registrat
 	t.Helper()
 	probePath := fmt.Sprintf("/service/by_path/__lease_probe_%d", leaseID)
 	probeName := fmt.Sprintf("__lease_probe_%d", leaseID)
+	// AddDiscovery with no active lease will defer the reply until the first real
+	// etcd write succeeds (pendingReply pattern).  We must publish the lease grant
+	// in a separate goroutine so we don't deadlock waiting on probeDone here.
 	probeDone := actor.AddDiscovery(context.Background(), &pb.AtappDiscovery{Id: uint64(leaseID), Name: probeName}, probePath, 16)
-	require.NoError(t, <-probeDone)
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		publishLeaseGranted(bus, leaseID, epoch)
 		if client.countPutKey(probePath) >= 1 {
+			require.NoError(t, <-probeDone)
 			_ = <-actor.RemoveService(context.Background(), probePath)
 			return
 		}
@@ -507,10 +510,9 @@ func TestRegistrationActor_FlushTopology_ReturnsErrNoLease_WhenNoActiveLease(t *
 	defer cancel()
 	go actor.Run(ctx)
 
-	// Enqueue a discovery so the mailbox goroutine is confirmed started.
-	_ = <-actor.AddDiscovery(context.Background(), &pb.AtappDiscovery{Id: 9, Name: "probe"}, "/service/probe", 16)
-
 	// Act: no lease granted — FlushTopology must return ErrNoLease.
+	// FlushTopology is synchronous (posts to mailbox + waits for reply),
+	// so it implicitly confirms the Run goroutine is alive.
 	err := actor.FlushTopology(context.Background())
 
 	// Assert

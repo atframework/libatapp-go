@@ -95,7 +95,7 @@ func (m *EtcdModule) Start(ctx context.Context) error {
 	}
 
 	// ── Wire actors ───────────────────────────────────────────────────
-	m.leaseActor = orchestrator.NewLeaseActor(m.client, m.bus)
+	m.leaseActor = orchestrator.NewLeaseActor(m.client, m.bus, m.cfg.LeaseTTL)
 	m.regActor = orchestrator.NewRegistrationActor(
 		m.client, m.bus,
 		m.cfg.ByNamePrefix, m.cfg.ByIDPrefix, m.cfg.TopologyPrefix,
@@ -114,8 +114,8 @@ func (m *EtcdModule) Start(ctx context.Context) error {
 		m.watchActor.AddPrefix(prefix)
 	}
 
-	// ── Start lease acquisition ───────────────────────────────────────
-	m.leaseActor.Start(m.cfg.LeaseTTL)
+	// NOTE: lease acquisition is NOT started here.  It is triggered lazily by
+	// the first RegisterService call via leaseActor.EnsureStarted.
 
 	// ── Periodic Tick goroutine (lease retry) ─────────────────────────
 	m.rt.Spawn(runCtx, func(ctx context.Context) {

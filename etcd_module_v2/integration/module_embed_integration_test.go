@@ -31,6 +31,7 @@ package integration_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -65,6 +66,15 @@ func TestModule_Embed_LeaseReleasedOnStop(t *testing.T) {
 	m := startEmbedModule(t, etcdAddr, nil)
 	ch := subscribeEmbedEvents(t, m)
 
+	// Trigger lazy lease acquisition via a registration request.
+	regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer regCancel()
+	_, _ = m.RegisterService(regCtx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: 9001, Name: "lease-released-svc"},
+		Path:      embedByIDPrefix + "/lease-released-9001",
+		TTL:       10,
+	})
+
 	// Verify that the real lease is non-zero.
 	env := waitForEmbedEvent(t, ch, modulev2.EventLeaseGranted, 15*time.Second)
 	pl, ok := env.Payload.(modulev2.LeaseGrantedPayload)
@@ -96,22 +106,24 @@ func TestModule_Embed_RegisterService_FiresRegistrationChanged(t *testing.T) {
 	m := startEmbedModule(t, etcdAddr, nil)
 	ch := subscribeEmbedEvents(t, m)
 
-	// Wait for a real lease to be established before registering.
-	waitForEmbedEvent(t, ch, modulev2.EventLeaseGranted, 15*time.Second)
-
 	svc := modulev2.ServiceInfo{
 		Discovery: &pb.AtappDiscovery{Id: 200, Name: "embed-svc-200"},
 		Path:      embedByIDPrefix + "/embed-svc-200",
 		TTL:       10,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// RegisterService triggers lazy lease acquisition; a real lease will be
+	// established before the PUT is replayed to etcd.
 	handle, err := m.RegisterService(ctx, svc)
 	require.NoError(t, err)
-	require.NoError(t, handle.Wait(ctx), "PUT to embed etcd must succeed with real lease")
+	// handle.Wait returns nil immediately (entry queued; actual write happens via replay).
+	_ = handle.Wait(ctx)
+	// Wait for the lease to be granted (proves a real non-zero lease exists).
+	waitForEmbedEvent(t, ch, modulev2.EventLeaseGranted, 15*time.Second)
 
-	// onAddDiscovery fires EventRegistrationChanged after the real PUT.
+	// EventRegistrationChanged is published only after the real lease replay PUT.
 	env := waitForEmbedEvent(t, ch, modulev2.EventRegistrationChanged, 5*time.Second)
 	_, ok := env.Payload.(modulev2.RegistrationChangedPayload)
 	assert.True(t, ok, "payload must be RegistrationChangedPayload")
@@ -135,20 +147,22 @@ func TestModule_Embed_RegisterService_NodeAppearsInSnapshot(t *testing.T) {
 	m := startEmbedModule(t, etcdAddr, []string{embedByIDPrefix})
 	ch := subscribeEmbedEvents(t, m)
 
-	// Wait for a real lease before calling RegisterService.
-	waitForEmbedEvent(t, ch, modulev2.EventLeaseGranted, 15*time.Second)
-
 	svc := modulev2.ServiceInfo{
 		Discovery: &pb.AtappDiscovery{Id: 201, Name: "embed-node-201"},
 		Path:      embedByIDPrefix + "/embed-node-201",
 		TTL:       10,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Use a longer timeout to accommodate lazy lease acquisition.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// Trigger lazy lease acquisition; lease will be established before the PUT.
 	handle, err := m.RegisterService(ctx, svc)
 	require.NoError(t, err)
-	require.NoError(t, handle.Wait(ctx))
+	// handle.Wait returns nil immediately (entry queued; write happens via replay).
+	_ = handle.Wait(ctx)
+	// Wait for the lease grant to confirm a real non-zero lease is in use.
+	waitForEmbedEvent(t, ch, modulev2.EventLeaseGranted, 15*time.Second)
 
 	// The Watch stream must deliver EventWatchNodeUp.
 	waitForEmbedEvent(t, ch, modulev2.EventWatchNodeUp, 5*time.Second)
@@ -220,4 +234,178 @@ func TestModule_Embed_ExternalPut_TriggersWatchNodeUp(t *testing.T) {
 		return ok
 	}, 5*time.Second, 20*time.Millisecond,
 		"snapshot must contain external node at %s", nodeKey)
+}
+
+// ── Lazy-lease lifecycle integration test ────────────────────────────────
+
+// TestModule_Embed_Lease_LazyGrantAndReleaseOnLastUnregister verifies the full
+// lazy-lease lifecycle against a real embedded etcd:
+//
+//  1. Before any RegisterService: no EventLeaseGranted fires, etcd has no leases.
+//  2. First RegisterService → EventLeaseGranted with a real non-zero LeaseID.
+//  3. Lease is verified alive via etcd TimeToLive.
+//  4. A second service is registered — the same lease is reused.
+//  5. First service is unregistered — lease still alive (refcount > 0).
+//  6. Last (second) service is unregistered → EventLeaseReleased fires.
+//  7. Lease is verified dead (TTL == -1) via external etcd client.
+func TestModule_Embed_Lease_LazyGrantAndReleaseOnLastUnregister(t *testing.T) {
+	// ── Arrange ───────────────────────────────────────────────────────────
+	etcdAddr := embedEtcdEndpoint(t)
+	m := startEmbedModule(t, etcdAddr, nil)
+	ch := subscribeEmbedEvents(t, m)
+	extCli := newEmbedClient(t, etcdAddr)
+
+	// ── Phase 1: no lease before any registration ─────────────────────────
+
+	// EventLeaseGranted must NOT fire within 150 ms.
+	require.Never(t, func() bool {
+		select {
+		case env := <-ch:
+			return env.Type == modulev2.EventLeaseGranted
+		default:
+			return false
+		}
+	}, 150*time.Millisecond, 20*time.Millisecond,
+		"no lease must be granted before the first RegisterService call")
+
+	// etcd itself must have zero leases.
+	listCtx, listCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer listCancel()
+	listResp, err := extCli.Lease.Leases(listCtx)
+	require.NoError(t, err, "Lease.Leases must succeed")
+	require.Empty(t, listResp.Leases, "etcd must have no leases before any registration")
+
+	// ── Phase 2: first RegisterService → lease granted ────────────────────
+	const (
+		svc1ID   = uint64(8001)
+		svc1Name = "lazy-grant-8001"
+		svc2ID   = uint64(8002)
+		svc2Name = "lazy-grant-8002"
+	)
+	svc1Path := fmt.Sprintf("%s/%s-%d", embedByIDPrefix, svc1Name, svc1ID)
+	svc2Path := fmt.Sprintf("%s/%s-%d", embedByIDPrefix, svc2Name, svc2ID)
+
+	regCtx, regCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer regCancel()
+
+	h1, err := m.RegisterService(regCtx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: svc1ID, Name: svc1Name},
+		Path:      svc1Path,
+		TTL:       10,
+	})
+	require.NoError(t, err)
+	_ = h1.Wait(regCtx)
+
+	grantEnv := waitForEmbedEvent(t, ch, modulev2.EventLeaseGranted, 15*time.Second)
+	grantPl, ok := grantEnv.Payload.(modulev2.LeaseGrantedPayload)
+	require.True(t, ok, "payload must be LeaseGrantedPayload")
+	leaseID := grantPl.LeaseID
+	require.NotZero(t, leaseID, "embed etcd must return a non-zero LeaseID")
+
+	// Verify the lease is alive with a positive TTL.
+	ttlCtx1, ttlCancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ttlCancel1()
+	ttlResp1, err := extCli.Lease.TimeToLive(ttlCtx1, leaseID)
+	require.NoError(t, err, "TimeToLive must not error while lease is active")
+	assert.Positive(t, ttlResp1.TTL, "lease TTL must be > 0 while a service is registered")
+
+	// Verify svc1 key actually exists in etcd KV and is attached to the lease.
+	kvCtx1, kvCancel1kv := context.WithTimeout(context.Background(), 5*time.Second)
+	defer kvCancel1kv()
+	getResp1, err := extCli.Get(kvCtx1, svc1Path)
+	require.NoError(t, err, "KV.Get for svc1 must succeed")
+	require.Len(t, getResp1.Kvs, 1, "svc1 key must exist in etcd KV after registration")
+	assert.Equal(t, int64(leaseID), getResp1.Kvs[0].Lease,
+		"svc1 KV entry must be attached to the active lease")
+
+	// ── Phase 3: second RegisterService — same lease, no new grant event ──
+	h2, err := m.RegisterService(regCtx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: svc2ID, Name: svc2Name},
+		Path:      svc2Path,
+		TTL:       10,
+	})
+	require.NoError(t, err)
+	_ = h2.Wait(regCtx)
+
+	// svc2 must appear in a RegistrationChanged event.
+	waitForRegChangedWith(t, ch, svc2Path, true, 5*time.Second)
+
+	// Verify svc2 key exists in etcd KV, attached to the same lease.
+	kvCtx2, kvCancel2kv := context.WithTimeout(context.Background(), 5*time.Second)
+	defer kvCancel2kv()
+	getResp2, err := extCli.Get(kvCtx2, svc2Path)
+	require.NoError(t, err, "KV.Get for svc2 must succeed")
+	require.Len(t, getResp2.Kvs, 1, "svc2 key must exist in etcd KV after registration")
+	assert.Equal(t, int64(leaseID), getResp2.Kvs[0].Lease,
+		"svc2 KV entry must be attached to the same lease as svc1")
+
+	// ── Phase 4: unregister svc1 — lease must still be alive ──────────────
+	require.NoError(t, m.UnregisterService(regCtx, svc1Path))
+
+	// No EventLeaseReleased may arrive while svc2 is still registered.
+	require.Never(t, func() bool {
+		select {
+		case env := <-ch:
+			return env.Type == modulev2.EventLeaseReleased
+		default:
+			return false
+		}
+	}, 300*time.Millisecond, 20*time.Millisecond,
+		"lease must not be released while svc2 is still registered")
+
+	// svc1 key must be gone from etcd KV (Delete was called by RegistrationActor).
+	kvCtx3, kvCancel3kv := context.WithTimeout(context.Background(), 5*time.Second)
+	defer kvCancel3kv()
+	getResp3, err := extCli.Get(kvCtx3, svc1Path)
+	require.NoError(t, err, "KV.Get for svc1 after unregister must succeed")
+	assert.Empty(t, getResp3.Kvs, "svc1 key must be deleted from etcd KV after unregistration")
+
+	// svc2 key must still exist.
+	getResp4, err := extCli.Get(kvCtx3, svc2Path)
+	require.NoError(t, err, "KV.Get for svc2 must succeed")
+	require.Len(t, getResp4.Kvs, 1, "svc2 key must still exist in etcd KV")
+
+	ttlCtx2, ttlCancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ttlCancel2()
+	ttlResp2, err := extCli.Lease.TimeToLive(ttlCtx2, leaseID)
+	require.NoError(t, err)
+	assert.Positive(t, ttlResp2.TTL, "lease TTL must remain > 0 while svc2 is registered")
+
+	// ── Phase 5: unregister last service → lease released ─────────────────
+	require.NoError(t, m.UnregisterService(regCtx, svc2Path))
+
+	relEnv := waitForEmbedEvent(t, ch, modulev2.EventLeaseReleased, 10*time.Second)
+	relPl, ok := relEnv.Payload.(modulev2.LeaseReleasedPayload)
+	require.True(t, ok, "payload must be LeaseReleasedPayload")
+	assert.Equal(t, leaseID, relPl.LeaseID, "released LeaseID must match the granted LeaseID")
+
+	// svc2 key must also be gone from etcd KV.
+	require.Eventually(t, func() bool {
+		kvCtx, kvCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer kvCancel()
+		resp, respErr := extCli.Get(kvCtx, svc2Path)
+		return respErr == nil && len(resp.Kvs) == 0
+	}, 5*time.Second, 50*time.Millisecond,
+		"svc2 key must be deleted from etcd KV after unregistration")
+
+	// Verify the lease is dead in etcd (TTL == -1 means revoked/expired).
+	require.Eventually(t, func() bool {
+		ttlCtx3, ttlCancel3 := context.WithTimeout(context.Background(), 2*time.Second)
+		defer ttlCancel3()
+		resp, respErr := extCli.Lease.TimeToLive(ttlCtx3, leaseID)
+		if respErr != nil {
+			return true // error also indicates the lease is gone
+		}
+		return resp.TTL == -1
+	}, 5*time.Second, 50*time.Millisecond,
+		"lease TTL must be -1 (revoked) after all services are unregistered")
+
+	// Mirror the Phase 1 check: etcd must report zero active leases.
+	require.Eventually(t, func() bool {
+		listCtx2, listCancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+		defer listCancel2()
+		resp, respErr := extCli.Lease.Leases(listCtx2)
+		return respErr == nil && len(resp.Leases) == 0
+	}, 5*time.Second, 50*time.Millisecond,
+		"etcd must have zero active leases after all services are unregistered")
 }

@@ -76,7 +76,7 @@ func TestLeaseActor_StartGrantsLease(t *testing.T) {
 	bus := runtime.NewEventBus()
 	evCh, _ := subscribeAll(bus, 16)
 
-	actor := orchestrator.NewLeaseActor(cli, bus)
+	actor := orchestrator.NewLeaseActor(cli, bus, 30)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go actor.Run(ctx)
@@ -116,7 +116,7 @@ func TestLeaseActor_KeepaliveExpiry_TriggersRebuild(t *testing.T) {
 	bus := runtime.NewEventBus()
 	evCh, _ := subscribeAll(bus, 32)
 
-	actor := orchestrator.NewLeaseActor(cli, bus)
+	actor := orchestrator.NewLeaseActor(cli, bus, 30)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go actor.Run(ctx)
@@ -144,7 +144,7 @@ func TestLeaseActor_Stop_CleanShutdown(t *testing.T) {
 	bus := runtime.NewEventBus()
 	evCh, _ := subscribeAll(bus, 16)
 
-	actor := orchestrator.NewLeaseActor(cli, bus)
+	actor := orchestrator.NewLeaseActor(cli, bus, 30)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go actor.Run(ctx)
@@ -183,7 +183,7 @@ func TestLeaseActor_Tick_RetriesAcquiring(t *testing.T) {
 	bus := runtime.NewEventBus()
 	evCh, _ := subscribeAll(bus, 16)
 
-	actor := orchestrator.NewLeaseActor(cli, bus)
+	actor := orchestrator.NewLeaseActor(cli, bus, 30)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go actor.Run(ctx)
@@ -214,7 +214,7 @@ func TestLeaseActor_Post_NonBlocking_WhenMailboxFull(t *testing.T) {
 	// Arrange: actor is NOT running — mailbox (cap=4) fills up quickly.
 	cli := startMockEtcd(t)
 	bus := runtime.NewEventBus()
-	actor := orchestrator.NewLeaseActor(cli, bus)
+	actor := orchestrator.NewLeaseActor(cli, bus, 30)
 
 	// Fill the mailbox.
 	for i := 0; i < 4; i++ {

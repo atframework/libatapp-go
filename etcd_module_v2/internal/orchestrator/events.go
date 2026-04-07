@@ -28,6 +28,14 @@ type LeaseReleasedPayload struct {
 	LeaseID clientv3.LeaseID
 }
 
+// RegistrationRequestedPayload is the Payload for EventRegistrationRequested.
+// Published by RegistrationActor when the first desired service is added.
+type RegistrationRequestedPayload struct{}
+
+// RegistrationEmptyPayload is the Payload for EventRegistrationEmpty.
+// Published by RegistrationActor when all desired services have been removed.
+type RegistrationEmptyPayload struct{}
+
 // RegistrationChangedPayload is the Payload carried by EventRegistrationChanged.
 // The maps are immutable after the envelope is published.
 type RegistrationChangedPayload struct {
