@@ -13,7 +13,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +64,7 @@ type AppConfig struct {
 	ConfigFile   string
 	PidFile      string
 	ExecutePath  string
+	IdCmd        string // from -id command line argument
 
 	// 日志配置
 	StartupLog       []string
@@ -241,6 +241,7 @@ func CreateAppInstance() AppImpl {
 	ret.flagSet.String("pid", "", "pid file path")
 	ret.flagSet.String("startup-log", "", "startup log output <\"stdout,stderr,stdsys,/path/to/file\">")
 	ret.flagSet.String("crash-output-file", "", "crash output file")
+	ret.flagSet.String("id", "", "set app id (highest priority, overrides config)")
 
 	ret.appContext, ret.stopAppHandle = context.WithCancel(context.Background())
 
@@ -852,7 +853,11 @@ func (app *AppInstance) Reload() error {
 
 // Getter methods
 func (app *AppInstance) GetId() uint64 {
-	idStr := app.config.ConfigPb.GetId()
+	// Priority: -id command line > config atapp.id
+	idStr := app.config.IdCmd
+	if idStr == "" {
+		idStr = app.config.ConfigPb.GetId()
+	}
 	if idStr == "" {
 		return 0
 	}
@@ -862,23 +867,14 @@ func (app *AppInstance) GetId() uint64 {
 		return app.cachedId.Load()
 	}
 
-	// Parse hex (0x...) or decimal string to uint64
-	var val uint64
-	var err error
-	if strings.HasPrefix(idStr, "0x") || strings.HasPrefix(idStr, "0X") {
-		val, err = strconv.ParseUint(idStr[2:], 16, 64)
-	} else {
-		val, err = strconv.ParseUint(idStr, 10, 64)
-	}
-	if err != nil {
-		return 0
-	}
+	val := ConvertAppIdByString(idStr, app.config.ConfigPb.GetIdMask())
 
 	// Cache the result
 	app.cachedId.Store(val)
 	app.cachedIdStr.Store(idStr)
 	return val
 }
+
 func (app *AppInstance) GetTypeId() uint64       { return app.config.ConfigPb.GetTypeId() }
 func (app *AppInstance) GetTypeName() string     { return app.config.ConfigPb.GetTypeName() }
 func (app *AppInstance) GetAppName() string      { return app.config.AppName }
@@ -1150,6 +1146,10 @@ func (app *AppInstance) setupOptions(arguments []string) error {
 
 	if app.flagSet.Lookup("crash-output-file").Value.String() != "" {
 		app.config.CrashOutputFile = ExpandExpression(app.flagSet.Lookup("crash-output-file").Value.String())
+	}
+
+	if app.flagSet.Lookup("id").Value.String() != "" {
+		app.config.IdCmd = ExpandExpression(app.flagSet.Lookup("id").Value.String())
 	}
 
 	// 检查位置参数以确定命令
