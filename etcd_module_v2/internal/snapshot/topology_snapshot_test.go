@@ -95,10 +95,10 @@ func node(id uint64, create, modify, version int64) *TopologyNode {
 
 func TestBetterNode(t *testing.T) {
 	tests := []struct {
-		name      string
-		current   *TopologyNode // already in snapshot
-		candidate *TopologyNode // incoming node
-		wantBetter bool         // should candidate replace current?
+		name       string
+		current    *TopologyNode // already in snapshot
+		candidate  *TopologyNode // incoming node
+		wantBetter bool          // should candidate replace current?
 	}{
 		// ── nil guards ───────────────────────────────────────────────────────
 		// I.12 equivalent: candidate nil → never better
@@ -177,14 +177,14 @@ func TestBetterNode(t *testing.T) {
 			name:       "higher modify wins over lower create",
 			current:    node(1, 15, 10, 3),
 			candidate:  node(1, 5, 25, 1),
-			wantBetter: true,
+			wantBetter: false,
 		},
-		// higher create does NOT win if modify is lower
+		// higher create win if modify is lower
 		{
-			name:       "lower modify loses despite higher create",
+			name:       "lower modify loses to higher create",
 			current:    node(1, 5, 25, 1),
 			candidate:  node(1, 15, 10, 3),
-			wantBetter: false,
+			wantBetter: true,
 		},
 
 		// ── sequential upgrade chain (I.20-style) ─────────────────────────

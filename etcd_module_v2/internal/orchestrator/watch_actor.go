@@ -14,6 +14,7 @@ import (
 
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/codec"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/etcdversion"
+	"github.com/atframework/libatapp-go/etcd_module_v2/internal/pathbuilder"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/runtime"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/snapshot"
 )
@@ -199,7 +200,7 @@ func (a *WatchActor) startStream(ctx context.Context, prefix string) {
 	go func() {
 		defer cancel()
 
-		isTopology := strings.Contains(prefix, "/topology")
+		isTopology := strings.Contains(prefix, "/"+pathbuilder.TopologyDir)
 
 		if isTopology {
 			a.publishTopologySnapshotLoading()
@@ -265,7 +266,7 @@ func (a *WatchActor) startStream(ctx context.Context, prefix string) {
 // ── etcd event dispatch ───────────────────────────────────────────────────
 
 func (a *WatchActor) dispatchKVEvent(prefix string, ev *clientv3.Event, revision int64) {
-	if strings.Contains(prefix, "/topology") {
+	if strings.Contains(prefix, "/"+pathbuilder.TopologyDir) {
 		a.dispatchTopologyKVEvent(ev, revision)
 		return
 	}

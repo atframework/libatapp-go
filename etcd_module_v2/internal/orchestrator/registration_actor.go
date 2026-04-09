@@ -30,6 +30,33 @@ type regMsg interface{ regMsgKind() }
 // a real etcd write failure.
 var ErrNoLease = errors.New("registration: no active lease")
 
+// ErrCheckerConflict is returned by AddDiscovery when a CheckerFn rejects the
+// current etcd value, indicating the key is already owned by another instance.
+var ErrCheckerConflict = errors.New("registration: conflict — key owned by another instance")
+
+// CheckerFn is a "write-before-check" ownership predicate injected into a
+// service registration.  It is called once before the first etcd.Put within a
+// lease epoch; the parameter is the current value stored in etcd ("" when the
+// key does not yet exist).
+//
+// Return true  → allow write; false → abort with ErrCheckerConflict.
+//
+// Once the checker passes, lease-replay writes within the SAME lease epoch
+// skip the check.  When the lease is rebuilt the checker re-runs (the key was
+// automatically evicted by etcd TTL, so a fresh ownership check is correct).
+type CheckerFn func(currentValue string) bool
+
+// DefaultChecker returns a CheckerFn that passes when the etcd key is absent
+// (empty value, fresh registration) OR already holds expectedValue (same-
+// identity restart).  It rejects any other value (conflict).
+//
+// This directly mirrors C++ etcd_keepalive::default_checker_t semantics.
+func DefaultChecker(expectedValue string) CheckerFn {
+	return func(currentValue string) bool {
+		return currentValue == "" || currentValue == expectedValue
+	}
+}
+
 // RegMsgType enumerates message kinds for logging and metrics.
 type RegMsgType uint8
 
@@ -78,15 +105,17 @@ type regMsgLeaseGranted struct {
 }
 type regMsgLeaseExpired struct{}
 type regMsgAddDiscovery struct {
-	Info  *pb.AtappDiscovery
-	Path  string
-	TTL   int64
-	Reply chan<- error
+	Info    *pb.AtappDiscovery
+	Path    string
+	TTL     int64
+	Checker CheckerFn // optional; nil → no pre-check
+	Reply   chan<- error
 }
 type regMsgAddTopology struct {
 	TopologyInfo *pb.AtappTopologyInfo
 	ServicePath  string
 	TTL          int64
+	Checker      CheckerFn // optional; nil → no pre-check
 	Reply        chan<- error
 }
 type regMsgRemoveService struct {
@@ -132,6 +161,13 @@ type discoveryRegistrationEntry struct {
 	retryCount   int
 	lastError    error
 	updatedAt    time.Time
+	// checker is the optional ownership predicate set on AddDiscovery.
+	// nil means no pre-check (direct PUT).
+	checker    CheckerFn
+	// checkerRun is true once the checker was executed (or was nil) within the
+	// current lease epoch.  It is reset to false on every new lease epoch so
+	// that a fresh key eviction by etcd TTL triggers a re-check.
+	checkerRun bool
 	// pendingReply is non-nil when AddDiscovery was called before a lease existed.
 	// The first definitive write result (success or error) drains and clears it.
 	pendingReply chan<- error
@@ -168,6 +204,12 @@ type topologyRegistrationEntry struct {
 	retryCount   int
 	lastError    error
 	updatedAt    time.Time
+	// checker is the optional ownership predicate set on AddTopology.
+	// nil means no pre-check (direct PUT).
+	checker    CheckerFn
+	// checkerRun is true once the checker was executed within the current lease
+	// epoch.  Reset to false on every new lease epoch (key TTL-evicted by etcd).
+	checkerRun bool
 	// pendingReply is non-nil when AddTopology was called before a lease existed.
 	pendingReply chan<- error
 }
@@ -258,22 +300,33 @@ func NewRegistrationActor(
 // AddDiscovery requests discovery registration for the given service.
 // Returns an error channel that receives nil on success or the first write
 // error.  Caller must read from the channel exactly once.
+//
+// An optional CheckerFn may be supplied to perform a "read-before-write"
+// ownership check before the first PUT within each lease epoch.  Pass
+// DefaultChecker(expectedValue) for the standard C++ keepalive semantic
+// (allows fresh key or same-identity value; rejects any other value).
+// Pass nil (or omit) to skip the check.
 func (a *RegistrationActor) AddDiscovery(
 	ctx context.Context,
 	info *pb.AtappDiscovery,
 	path string,
 	ttl int64,
+	checker ...CheckerFn,
 ) <-chan error {
 	ch := make(chan error, 1)
 	if info == nil {
 		ch <- nil
 		return ch
 	}
-	msg := regMsgAddDiscovery{Info: info, Path: path, TTL: ttl, Reply: ch}
 	if path == "" {
 		ch <- fmt.Errorf("empty discovery path")
 		return ch
 	}
+	var fn CheckerFn
+	if len(checker) > 0 {
+		fn = checker[0]
+	}
+	msg := regMsgAddDiscovery{Info: info, Path: path, TTL: ttl, Checker: fn, Reply: ch}
 	if err := a.PostCtx(ctx, msg); err != nil {
 		ch <- err
 		return ch
@@ -282,18 +335,25 @@ func (a *RegistrationActor) AddDiscovery(
 }
 
 // AddTopology requests topology registration for the given service.
+// An optional CheckerFn may be supplied for the same "read-before-write"
+// ownership semantics as AddDiscovery.
 func (a *RegistrationActor) AddTopology(
 	ctx context.Context,
 	topologyInfo *pb.AtappTopologyInfo,
 	servicePath string,
 	ttl int64,
+	checker ...CheckerFn,
 ) <-chan error {
 	ch := make(chan error, 1)
 	if topologyInfo == nil {
 		ch <- nil
 		return ch
 	}
-	msg := regMsgAddTopology{TopologyInfo: topologyInfo, ServicePath: servicePath, TTL: ttl, Reply: ch}
+	var fn CheckerFn
+	if len(checker) > 0 {
+		fn = checker[0]
+	}
+	msg := regMsgAddTopology{TopologyInfo: topologyInfo, ServicePath: servicePath, TTL: ttl, Checker: fn, Reply: ch}
 	if err := a.PostCtx(ctx, msg); err != nil {
 		ch <- err
 		return ch
@@ -424,7 +484,10 @@ func (a *RegistrationActor) onLeaseGranted(msg regMsgLeaseGranted) {
 	for key, svc := range a.st.discoveryServices {
 		if svc.desired && (svc.stale || !svc.registered) {
 			// Reset backoff counter so a brand-new lease epoch starts from 0.
+			// Reset checkerRun so that ownership is re-verified on the new lease:
+			// the old key was TTL-evicted by etcd, meaning a fresh check is safe.
 			svc.retryCount = 0
+			svc.checkerRun = false
 			a.st.discoveryServices[key] = svc
 			a.Post(regMsgReplayDiscovery{ServiceKey: key, LeaseEpoch: msg.LeaseEpoch})
 			count++
@@ -433,6 +496,7 @@ func (a *RegistrationActor) onLeaseGranted(msg regMsgLeaseGranted) {
 	for key, svc := range a.st.topologyServices {
 		if svc.desired && (svc.stale || !svc.registered) {
 			svc.retryCount = 0
+			svc.checkerRun = false
 			a.st.topologyServices[key] = svc
 			a.Post(regMsgReplayTopology{TopologyKey: key, LeaseEpoch: msg.LeaseEpoch})
 			count++
@@ -456,6 +520,7 @@ func (a *RegistrationActor) onAddDiscovery(msg regMsgAddDiscovery) {
 		ttl:     msg.TTL,
 		desired: true,
 		stale:   true, // needs a write
+		checker: msg.Checker,
 	}
 	a.st.discoveryServices[msg.Path] = discoveryEntry
 
@@ -473,7 +538,7 @@ func (a *RegistrationActor) onAddDiscovery(msg regMsgAddDiscovery) {
 		return
 	}
 
-	if err := a.putDiscoveryWithLease(context.Background(), discoveryEntry); err != nil {
+	if err := a.putDiscoveryWithLease(context.Background(), &discoveryEntry); err != nil {
 		if msg.Reply != nil {
 			msg.Reply <- err
 		}
@@ -516,6 +581,7 @@ func (a *RegistrationActor) onAddTopology(msg regMsgAddTopology) {
 		ttl:     msg.TTL,
 		desired: true,
 		stale:   true,
+		checker: msg.Checker,
 	}
 	a.st.topologyServices[topologyKey] = topologyEntry
 	if msg.ServicePath != "" {
@@ -535,7 +601,7 @@ func (a *RegistrationActor) onAddTopology(msg regMsgAddTopology) {
 		return
 	}
 
-	if err := a.putTopologyWithLease(context.Background(), topologyEntry); err != nil {
+	if err := a.putTopologyWithLease(context.Background(), &topologyEntry); err != nil {
 		topologyEntry.markFailed(err)
 		a.st.topologyServices[topologyKey] = topologyEntry
 		if msg.Reply != nil {
@@ -607,7 +673,7 @@ func (a *RegistrationActor) onSyncTopology(ctx context.Context) error {
 		if !svc.desired || !svc.registered {
 			continue
 		}
-		if err := a.putTopologyWithLease(ctx, svc); err != nil {
+		if err := a.putTopologyWithLease(ctx, &svc); err != nil {
 			log.Warn("[RegistrationActor] topology sync failed",
 				"key", key,
 				"err", err)
@@ -637,7 +703,7 @@ func (a *RegistrationActor) onReplayDiscovery(msg regMsgReplayDiscovery) {
 	if msg.LeaseEpoch != a.st.leaseEpoch {
 		return
 	}
-	if err := a.putDiscoveryWithLease(context.Background(), svc); err != nil {
+	if err := a.putDiscoveryWithLease(context.Background(), &svc); err != nil {
 		log.Warn("[RegistrationActor] replay discovery write failed",
 			"key", msg.ServiceKey,
 			"retry", svc.retryCount,
@@ -683,7 +749,7 @@ func (a *RegistrationActor) onReplayTopology(msg regMsgReplayTopology) {
 	if msg.LeaseEpoch != a.st.leaseEpoch {
 		return
 	}
-	if err := a.putTopologyWithLease(context.Background(), svc); err != nil {
+	if err := a.putTopologyWithLease(context.Background(), &svc); err != nil {
 		log.Warn("[RegistrationActor] replay topology write failed",
 			"key", msg.TopologyKey,
 			"retry", svc.retryCount,
@@ -720,12 +786,29 @@ func (a *RegistrationActor) onReplayTopology(msg regMsgReplayTopology) {
 
 // ── etcd write helpers ────────────────────────────────────────────────────
 
-func (a *RegistrationActor) putDiscoveryWithLease(ctx context.Context, svc discoveryRegistrationEntry) error {
+func (a *RegistrationActor) putDiscoveryWithLease(ctx context.Context, svc *discoveryRegistrationEntry) error {
 	if svc.info == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+
+	// Ownership check: if a checker is set and hasn't been run yet within this
+	// lease epoch, GET the primary (by-path) key and evaluate the predicate.
+	if svc.checker != nil && !svc.checkerRun {
+		resp, getErr := a.etcdClient.Get(ctx, svc.path)
+		if getErr != nil {
+			return fmt.Errorf("checker get %s: %w", svc.path, getErr)
+		}
+		var currentValue string
+		if len(resp.Kvs) > 0 {
+			currentValue = string(resp.Kvs[0].Value)
+		}
+		svc.checkerRun = true // mark as run regardless of outcome
+		if !svc.checker(currentValue) {
+			return ErrCheckerConflict
+		}
+	}
 
 	leaseOpt := clientv3.WithLease(a.st.leaseID)
 
@@ -765,18 +848,34 @@ func (a *RegistrationActor) putDiscoveryWithLease(ctx context.Context, svc disco
 	return nil
 }
 
-func (a *RegistrationActor) putTopologyWithLease(ctx context.Context, svc topologyRegistrationEntry) error {
+func (a *RegistrationActor) putTopologyWithLease(ctx context.Context, svc *topologyRegistrationEntry) error {
 	if svc.info == nil || svc.key == "" {
 		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	// Ownership check: GET→predicate before first PUT within this lease epoch.
+	if svc.checker != nil && !svc.checkerRun {
+		resp, getErr := a.etcdClient.Get(ctx, svc.key)
+		if getErr != nil {
+			return fmt.Errorf("checker get %s: %w", svc.key, getErr)
+		}
+		var currentValue string
+		if len(resp.Kvs) > 0 {
+			currentValue = string(resp.Kvs[0].Value)
+		}
+		svc.checkerRun = true
+		if !svc.checker(currentValue) {
+			return ErrCheckerConflict
+		}
 	}
 
 	topologyBytes, err := codec.MarshalTopologyToJSON(svc.info)
 	if err != nil {
 		return fmt.Errorf("marshal topology info: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
 
 	if _, err := a.etcdClient.Put(ctx, svc.key, string(topologyBytes), clientv3.WithLease(a.st.leaseID)); err != nil {
 		return fmt.Errorf("put topology %s: %w", svc.key, err)

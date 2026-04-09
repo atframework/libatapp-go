@@ -263,15 +263,19 @@ func betterNode(current *TopologyNode, candidate *TopologyNode) bool {
 	if candidate == nil {
 		return false
 	}
+
 	if current == nil {
 		return true
 	}
-	if candidate.ModRevision != current.ModRevision {
-		return candidate.ModRevision > current.ModRevision
-	}
+
 	if candidate.CreateRevision != current.CreateRevision {
 		return candidate.CreateRevision > current.CreateRevision
 	}
+
+	if candidate.ModRevision != current.ModRevision {
+		return candidate.ModRevision > current.ModRevision
+	}
+
 	if candidate.Version != current.Version {
 		return candidate.Version > current.Version
 	}

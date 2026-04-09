@@ -443,3 +443,69 @@ func TestModule_StopAndNewModuleStart_RegrantsLease(t *testing.T) {
 	assert.Equal(t, uint64(1), env.LeaseEpoch,
 		"new module must start with lease epoch 1")
 }
+// TestModule_EventLeaseGranted_FiredOnSubscribeIfAlreadyActive corresponds to
+// C++ I.1.6 (cluster_event_up_down_callbacks).
+//
+// In C++, add_on_event_up(callback, trigger_if_running=true) fires the callback
+// immediately when the cluster is already running, so late joiners never miss
+// the "already active" state.
+//
+// In Go, the EventBus has no replay semantics.  The idiomatic equivalent is:
+//   1. Subscribe before the event can fire  (get future deliveries), OR
+//   2. Query current state via GetSnapshot() (read-your-writes without replay).
+//
+// This test verifies both aspects of the Go model:
+//   a. A subscriber registered AFTER EventLeaseGranted epoch=1 was published
+//      does NOT receive a passive replay of that event.
+//   b. The same late subscriber can determine the module is active (lease held,
+//      snapshot ready) through GetSnapshot().Discovery.Ready — the Go
+//      equivalent of the C++ trigger_if_running guarantee.
+func TestModule_EventLeaseGranted_FiredOnSubscribeIfAlreadyActive(t *testing.T) {
+	// Arrange: start module with watched prefix, subscribe early, register a
+	// service to trigger lazy lease acquisition.
+	m := startActorIntegModule(t, []string{actorIntegByIDPrefix})
+	earlySubCh := subscribeActorIntegEvents(t, m)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := m.RegisterService(ctx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: 201, Name: "trigger-if-running-svc"},
+		Path:      actorIntegByIDPrefix + "/trigger-if-running-201",
+		TTL:       10,
+	})
+	require.NoError(t, err)
+
+	// Wait until lease is granted (epoch=1): the module is now holding a lease.
+	// Note: EventWatchSnapshotLoaded may fire inside Start() before earlySubCh
+	// is set up, so we do NOT wait for it via the channel.  Instead, the
+	// snapshot readiness assertion below polls GetSnapshot() directly, which is
+	// the authoritative signal regardless of event ordering.
+	waitForActorIntegEvent(t, earlySubCh, modulev2.EventLeaseGranted, 5*time.Second)
+
+	// Act: subscribe a LATE handler — this is the Go equivalent of calling
+	// add_on_event_up(callback, trigger_if_running=true) after the cluster is up.
+	lateSubCh := subscribeActorIntegEvents(t, m)
+
+	// Assert (a): EventBus has no replay — the late subscriber must NOT receive
+	// the already-published EventLeaseGranted passively.
+	require.Never(t, func() bool {
+		select {
+		case env := <-lateSubCh:
+			return env.Type == modulev2.EventLeaseGranted
+		default:
+			return false
+		}
+	}, 300*time.Millisecond, 20*time.Millisecond,
+		"EventBus must not replay past EventLeaseGranted to a late subscriber")
+
+	// Assert (b): Go equivalent of trigger_if_running — the late subscriber can
+	// determine the active state by querying GetSnapshot().Discovery.Ready.
+	// This is functionally equivalent to the C++ up_count > 0 assertion.
+	require.Eventually(t, func() bool {
+		snap := m.GetSnapshot()
+		return snap != nil && snap.Discovery.Ready
+	}, 3*time.Second, 20*time.Millisecond,
+		"late subscriber can detect active lease via GetSnapshot().Discovery.Ready "+
+			"(Go equivalent of C++ trigger_if_running)")
+}

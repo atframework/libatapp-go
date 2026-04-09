@@ -10,11 +10,10 @@ import (
 
 // Sub-directory constants under the discovery base prefix.
 const (
-	ByIDDir       = "by_id"
-	ByNameDir     = "by_name"
-	ByTypeIDDir   = "by_type_id"
-	ByTypeNameDir = "by_type_name"
-	ByTagDir      = "by_tag"
+	ByIDDir     = "by_id"
+	ByNameDir   = "by_name"
+	ByTagDir    = "by_tag"
+	TopologyDir = "topology"
 )
 
 func formatUint(v uint64) string {
@@ -36,7 +35,7 @@ func BuildByTypeIDPath(base string, info *pb.AtappDiscovery) string {
 	if info == nil {
 		return ""
 	}
-	return base + "/" + ByTypeIDDir + "/" + formatUint(info.GetTypeId()) + "/" + info.GetName() + "-" + formatUint(info.GetId())
+	return base + "/by_type_id/" + formatUint(info.GetTypeId()) + "/" + info.GetName() + "-" + formatUint(info.GetId())
 }
 
 // BuildByTypeNamePath returns the by-type-name indexed etcd key.
@@ -45,7 +44,7 @@ func BuildByTypeNamePath(base string, info *pb.AtappDiscovery) string {
 	if info == nil {
 		return ""
 	}
-	return base + "/" + ByTypeNameDir + "/" + info.GetTypeName() + "/" + info.GetName() + "-" + formatUint(info.GetId())
+	return base + "/by_type_name/" + info.GetTypeName() + "/" + info.GetName() + "-" + formatUint(info.GetId())
 }
 
 // BuildByNamePath returns the by-name indexed etcd key.
@@ -76,13 +75,13 @@ func BuildByIDWatcherPath(base string) string {
 // BuildByTypeIDWatcherPath returns the prefix to watch all by-type-id records
 // for the given typeID.
 func BuildByTypeIDWatcherPath(base string, typeID uint64) string {
-	return base + "/" + ByTypeIDDir + "/" + formatUint(typeID)
+	return base + "/by_type_id/" + formatUint(typeID)
 }
 
 // BuildByTypeNameWatcherPath returns the prefix to watch all by-type-name
 // records for the given typeName.
 func BuildByTypeNameWatcherPath(base, typeName string) string {
-	return base + "/" + ByTypeNameDir + "/" + typeName
+	return base + "/by_type_name/" + typeName
 }
 
 // BuildByNameWatcherPath returns the prefix to watch all by-name records.

@@ -225,3 +225,80 @@ func TestModule_Embed_Register(t *testing.T) {
 	assert.NotNil(t, pl3.ByPath[svc3Path], "svc3 必须仍在快照 ByPath 中")
 	assert.Len(t, pl3.ByPath, 2, "svc1 注销后快照 ByPath 中应剩余 svc2 和 svc3")
 }
+// TestModule_Embed_Unregister_ThenReregister_SamePath corresponds to C++ I.2.6
+// (keepalive_remove_and_readd).
+//
+// It verifies that after a service is unregistered (key deleted from etcd),
+// registering a new service at the SAME path causes the Watch stream to deliver
+// a fresh EventWatchNodeUp and the node appears in the projection snapshot.
+//
+// In C++ the test calls remove_keepalive → direct_etcd_kv_del →
+// add_keepalive(ka2) and asserts ka2.has_data() plus the etcd key value.
+// In Go, UnregisterService already deletes the etcd key (Delete call in
+// onRemoveDiscovery), so there is no need for a manual key delete step.
+func TestModule_Embed_Unregister_ThenReregister_SamePath(t *testing.T) {
+	// Arrange
+	etcdAddr := embedEtcdEndpoint(t)
+	m := startEmbedModule(t, etcdAddr, []string{embedByIDPrefix})
+	ch := subscribeEmbedEvents(t, m)
+
+	// Wait for the initial (empty) watch snapshot so the stream is established
+	// before any writes.  This avoids the node being seen in the snapshot rather
+	// than as an incremental event.
+	waitForEmbedEvent(t, ch, modulev2.EventWatchSnapshotLoaded, 15*time.Second)
+
+	const (
+		svcID   = uint64(601)
+		svcName = "readd-svc-601"
+	)
+	svcPath := fmt.Sprintf("%s/%s-%d", embedByIDPrefix, svcName, svcID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// ── Act 1: register ───────────────────────────────────────────────
+	_, err := m.RegisterService(ctx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: svcID, Name: svcName},
+		Path:      svcPath,
+		TTL:       10,
+	})
+	require.NoError(t, err)
+
+	// Watch stream must deliver NodeUp; snapshot must include the node.
+	waitForEmbedEvent(t, ch, modulev2.EventWatchNodeUp, 5*time.Second)
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap := m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.NotNil(t, snap.Discovery.NodesByPath[svcPath], "node must be present after first registration")
+
+	// ── Act 2: unregister ─────────────────────────────────────────────
+	require.NoError(t, m.UnregisterService(ctx, svcPath))
+
+	// Watch stream must deliver NodeDown; snapshot must remove the node.
+	waitForEmbedEvent(t, ch, modulev2.EventWatchNodeDown, 5*time.Second)
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap = m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.Nil(t, snap.Discovery.NodesByPath[svcPath], "node must be absent after unregister")
+
+	// ── Act 3: re-register same path ──────────────────────────────────
+	_, err = m.RegisterService(ctx, modulev2.ServiceInfo{
+		Discovery: &pb.AtappDiscovery{Id: svcID, Name: svcName},
+		Path:      svcPath,
+		TTL:       10,
+	})
+	require.NoError(t, err)
+
+	// Watch stream must deliver a fresh NodeUp for the same path.
+	upEnv := waitForEmbedEvent(t, ch, modulev2.EventWatchNodeUp, 5*time.Second)
+	pl, ok := upEnv.Payload.(modulev2.WatchNodePayload)
+	require.True(t, ok, "payload must be WatchNodePayload")
+	assert.Equal(t, svcPath, pl.Key, "WatchNodeUp key must match the re-registered path")
+
+	// Snapshot must reflect the re-registered node.
+	waitForEmbedEvent(t, ch, modulev2.EventProjectionSnapshotUpdated, 3*time.Second)
+	snap = m.GetSnapshot()
+	require.NotNil(t, snap)
+	assert.NotNil(t, snap.Discovery.NodesByPath[svcPath],
+		"node must be present in snapshot after re-registration")
+}

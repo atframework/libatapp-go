@@ -208,6 +208,48 @@ func TestLeaseActor_Tick_RetriesAcquiring(t *testing.T) {
 	waitForEvent(t, evCh, runtime.EventLeaseGranted, 5*time.Second)
 }
 
+// TestLeaseActor_IDStableAcrossRenewal corresponds to C++ I.1.3
+// (cluster_lease_grant_and_keepalive).
+//
+// It verifies that the lease ID (represented by the epoch counter) does NOT
+// change while keepalive is healthy.  In C++ the test calls
+// cluster.get_lease() before and after several ticks and asserts the two values
+// are equal.  In Go, LeaseEpoch serves the same discriminant role: it
+// increments on every Grant but is unchanged by keepalive renewals.
+//
+// The test grants a lease, waits 1 s while the keepalive loop runs, then
+// asserts that no second EventLeaseGranted event was published during that
+// window — proving the lease was renewed in place rather than re-granted.
+func TestLeaseActor_IDStableAcrossRenewal(t *testing.T) {
+	// Arrange
+	cli := startMockEtcd(t)
+	bus := runtime.NewEventBus()
+	evCh, _ := subscribeAll(bus, 32)
+
+	actor := orchestrator.NewLeaseActor(cli, bus, 30)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	actor.Start(10)
+
+	// Act: wait for the initial grant (epoch=1).
+	firstEnv := waitForEvent(t, evCh, runtime.EventLeaseGranted, 5*time.Second)
+	assert.Equal(t, uint64(1), firstEnv.LeaseEpoch, "first grant must have epoch=1")
+
+	// Assert: no second EventLeaseGranted must arrive while keepalive is healthy.
+	// 1 s is sufficient for several keepalive ticks without triggering a rebuild.
+	require.Never(t, func() bool {
+		select {
+		case e := <-evCh:
+			return e.Type == runtime.EventLeaseGranted
+		default:
+			return false
+		}
+	}, 1*time.Second, 50*time.Millisecond,
+		"lease ID must remain stable across keepalive renewals (no re-grant expected)")
+}
+
 // TestLeaseActor_Post_NonBlocking_WhenMailboxFull verifies that a Tick() call
 // never blocks even when the actor's mailbox is already full.
 func TestLeaseActor_Post_NonBlocking_WhenMailboxFull(t *testing.T) {

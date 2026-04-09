@@ -121,6 +121,45 @@ func TestGetNodeByRandom_Filter(t *testing.T) {
 	assert.Equal(t, routingPrefix+"/prod", node.Path)
 }
 
+// TestGetNodeByRoundRobin_Wrap verifies that round-robin wraps back to the
+// first node after cycling through all N nodes (mirrors C++ round_robin test).
+func TestGetNodeByRoundRobin_Wrap(t *testing.T) {
+	fixtures := []DiscoveryFixture{
+		{Path: routingPrefix + "/a", Discovery: &pb.AtappDiscovery{Id: 1, Name: "svc-a", Runtime: &pb.AtappDiscoveryRuntime{StatefulPodIndex: 0}}},
+		{Path: routingPrefix + "/b", Discovery: &pb.AtappDiscovery{Id: 2, Name: "svc-b", Runtime: &pb.AtappDiscoveryRuntime{StatefulPodIndex: 1}}},
+		{Path: routingPrefix + "/c", Discovery: &pb.AtappDiscovery{Id: 3, Name: "svc-c", Runtime: &pb.AtappDiscoveryRuntime{StatefulPodIndex: 2}}},
+	}
+	m := makeEmbedNodesModule(t, routingPrefix, fixtures, modulev2.ModuleOptions{})
+
+	// First full cycle: a → b → c
+	n1, err := m.GetNodeByRoundRobin(nil)
+	require.NoError(t, err)
+	n2, err := m.GetNodeByRoundRobin(nil)
+	require.NoError(t, err)
+	n3, err := m.GetNodeByRoundRobin(nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, routingPrefix+"/a", n1.Path)
+	assert.Equal(t, routingPrefix+"/b", n2.Path)
+	assert.Equal(t, routingPrefix+"/c", n3.Path)
+
+	// N+1th call must wrap back to the first node (StatefulPodIndex 0).
+	n4, err := m.GetNodeByRoundRobin(nil)
+	require.NoError(t, err)
+	require.NotNil(t, n4)
+	assert.Equal(t, n1.Path, n4.Path, "round-robin must wrap back to first node after full cycle")
+}
+
+// TestGetNodeByRandom_Empty verifies that GetNodeByRandom returns an error when
+// the snapshot contains no nodes (mirrors C++ discovery_empty_set_operations).
+func TestGetNodeByRandom_Empty(t *testing.T) {
+	m := makeEmbedNodesModule(t, routingPrefix, nil, modulev2.ModuleOptions{})
+
+	node, err := m.GetNodeByRandom(nil)
+	assert.Nil(t, node)
+	assert.Error(t, err)
+}
+
 // TestGetNodeByRoundRobin_Empty verifies that GetNodeByRoundRobin returns an
 // error when the snapshot contains no nodes (watch loaded, but etcd is empty).
 func TestGetNodeByRoundRobin_Empty(t *testing.T) {

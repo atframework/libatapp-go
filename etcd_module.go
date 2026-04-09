@@ -53,6 +53,11 @@ type EtcdDiscoverySet = modulev2.DiscoverySetSnapshot
 // Keepalive ownership is in v2 module internals.
 type EtcdRegistration struct {
 	path string
+	// Err holds an error from the most recent registration attempt.
+	// nil means the registration succeeded.
+	// Use errors.Is(reg.GetError(), modulev2.ErrCheckerConflict) to detect
+	// ownership conflicts.
+	Err error
 }
 
 // GetPath returns the registration key path.
@@ -61,6 +66,16 @@ func (r *EtcdRegistration) GetPath() string {
 		return ""
 	}
 	return r.path
+}
+
+// GetError returns any error recorded during registration.
+// nil indicates success.  A non-nil error means the registration write was
+// either rejected (e.g. ErrCheckerConflict) or failed for another reason.
+func (r *EtcdRegistration) GetError() error {
+	if r == nil {
+		return nil
+	}
+	return r.Err
 }
 
 // NodeInfo represents discovery node information with an associated action.

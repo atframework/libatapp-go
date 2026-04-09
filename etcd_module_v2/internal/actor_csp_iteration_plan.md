@@ -131,17 +131,6 @@ em.Publish(event)           ← 同步调用所有 subscriber
 | `EtcdDiscoverySet` | 发现节点索引 | 3 map (RWMutex) | HandleWatcherEvent/ApplySnapshot |
 | `EtcdWatcher` | 单条 etcd watch 流 | stream/revision | Start/Stop |
 
-### 1.4 已知问题清单
-
-| # | 描述 | 严重度 | 当前状态 |
-|---|------|--------|---------|
-| P1 | `SetLease()` 在 eventLoop goroutine 上执行同步 etcd I/O | 🔴 严重 | 未修复 |
-| P2 | `kaCtx` 来自 `context.Background()` 而非 `runCtx` | 🔴 严重 | 未修复 |
-| P3 | `publishClusterEventSync` 在 `ensureClusterLease`(singleflight) 内同步发布 | 🟠 中 | 未修复 |
-| P4 | `onDestroy` 在 `removeNodeWithEvent` 关键路径上执行 | 🟡 低 | 未修复 |
-| P5 | `GetDiscoveryInfo()` 裸指针暴露 (WithDiscoveryInfo 是替代方案，未删旧接口) | 🟡 低 | 部分 |
-| P6 | 多处 `context.Background()` 无超时 (TriggerMaybeUpdate L862) | 🟠 中 | 未修复 |
-
 ---
 
 ## 二、v2 目标架构：四层模型
@@ -249,14 +238,6 @@ Topology 视图与 bypath/byname/byid 索引视图统一纳入同一个投影 Ac
 2. 它仅处理 Watch 事件（Discovery + Topology），**不**订阅 `EventRegistrationChanged`。
 3. `RegistrationActor` 不负责对外快照发布，只负责写入 etcd 与维护写侧状态。
 4. `ExportSnapshot` 只反映 Watch 结果（远端节点），自节点注册状态通过 `EventRegistrationChanged` 独立广播，不进入快照。
-
-### 2.4 与 etcd_module/cluster 的关系演进
-
-| 阶段 | v2 对 cluster 的依赖 | cluster 的角色 |
-|------|---------------------|---------------|
-| **现在**（过渡）| v2 正在从 `cluster.EtcdCluster` 过渡到直连 etcdClient | cluster = 中间层 |
-| **中期**（Phase B-C 完成后）| v2 Actors 直接依赖 etcdClient 接口（含 LeaseActor Grant/KeepAlive）；`bindLeaseEventBridge` 对 v2 关闭 | cluster = 遗留层 |
-| **长期**（v1 废弃后）| cluster 层降级合并至 client 层，或整体移除 | cluster 废弃 |
 
 ---
 
@@ -1180,133 +1161,11 @@ lease 变更主流程（最终定义）：
 
 ---
 
-## 五、Task 概念决策
-
-**结论：不引入显式 Task 类型。**
-
-| 用途 | 实现方式 |
-|------|---------|
-| "续期 lease 的 task" | LeaseActor 本身（长期运行的状态机） |
-| 往 etcd 提交自身注册（addNode） | RegistrationActor 内部 `serviceEntry` 状态驱动（依赖 lease） |
-| `etcdClient.Grant()` | 单次 RPC call，通过 `reply chan<- error` 返回结果（actorBase 现有模式） |
-| KeepAlive loop | LeaseActor 通过 `runtime.Spawn()` 管理的内部 goroutine |
-
-RegistrationActor 的最小状态流：
-
-```
-NoLease(desired=true, registered=false)
-     --(LeaseGranted)--> Applying
-Applying
-     --(put path/name/id/topology 全成功)--> Registered(registered=true, stale=false)
-     --(任一写入失败)--> Retry(stale=true, retryCount++)
-Registered
-     --(LeaseExpired or config changed)--> Stale(registered=false, stale=true)
-Stale
-     --(next LeaseGranted)--> Applying
-```
-
-addNode 示例（无 Task 类型）：
-
-```text
-1) AddNode(serviceA) 到达 RegistrationActor
-    - 写 services[serviceA]: desired=true, registered=false, stale=true
-2) 当前无 lease
-    - 不写 etcd，等待 LeaseGranted
-3) LeaseGranted(leaseID=100)
-    - 对 services[serviceA] 依序写: bypath -> byname -> byid -> topology（均附 lease=100）
-4) 全部成功
-    - services[serviceA] 更新为 registered=true, stale=false
-5) LeaseExpired
-    - services[serviceA] 置 registered=false, stale=true（不主动 delete，依赖 lease TTL 回收）
-6) 新 LeaseGranted(leaseID=101)
-    - 再次按顺序重放写入，完成 rebuild
-```
-
 关键约束：
 1. 全流程只由 RegistrationActor 单 goroutine 串行驱动。
 2. 旧 lease 的 registered 记录在 lease 变化后必须转 stale 并重放。
 3. 单个 service 的提交顺序固定为：`bypath -> byname -> byid -> topology`。
 
-因此，addNode 语义由 `serviceEntry` 状态承载，不需要额外 Task 类型。
 
 ---
 
-## 六、实现阶段（v2 重写）
-
-> **每阶段验收标准**：`go test ./... -count=1` 全绿 + `-race` 无竞态 + goroutine 无泄漏
-
-### Phase A：架构层目录就位
-
-- 建立 `internal/runtime/` 目录骨架
-- 将现有 `actor_runtime.go` 拆分为 `runtime/actor.go` + `runtime/lifecycle.go`
-- 新增 `runtime/event_bus.go`（适配现有 `etcd_module/events`）
-- 现有 orchestrator 文件暂维持原位，不移动
-
-### Phase B：LeaseActor
-
-- 新增 `internal/orchestrator/lease_actor.go`
-- 实现完整状态机（Idle → Acquiring → Active → Rebuilding）
-- LeaseActor 直接持有 etcdClient 接口并调用 `Grant/KeepAlive/Revoke`
-- KeepAlive goroutine 绑定 Actor 子 ctx；expired 时非阻塞投 `leaseMsgExpired`
-- 通过 EventBus 发布三种 Lease 事件
-- 测试：状态转换、mailbox 满时非阻塞、事件正确发布、goroutine 不泄漏
-
-### Phase C：RegistrationActor 扩展
-
-- 在现有 `registration_actor.go` 基础上扩展：增加 bypath / byname / byid 注册能力
-- 订阅 `LeaseGranted` → 批量注册；订阅 `LeaseExpired` → 清空 registered 标记
-- 注册集合由配置驱动（Init/Reload），并在变更时触发 rebuild
-- 使用 `serviceEntry` 状态字段表达 addNode 依赖 lease 完成后再提交（不新增 Task 类型）
-- 上报 `RegistrationIndexChanged` 事件供 ProjectionActor 更新导出快照
-- 迁移至 `internal/orchestrator/registration_actor.go`
-- 测试：lease 变更后重放、AddService 在无 lease 时保持 pending 状态、并发 Add/Remove
-
-### Phase D：WatchActor
-
-- 新增 `internal/orchestrator/watch_actor.go`
-- 复用 `etcd_module/watcher/` 底层 stream 能力
-- 通过 EventBus 发布 NodeUp/Down/SnapshotLoaded 事件
-- 测试：prefix add/remove、事件非阻塞投递到 ProjectionActor
-
-### Phase E：ProjectionActor 迁移 + event 驱动切换
-
-- 移入 `internal/orchestrator/projection_actor.go`
-- 改为订阅 WatchActor 发布的 EventBus 事件（替代直接函数回调）
-- 同时订阅 `RegistrationIndexChanged` 事件，合并拓扑与索引子视图后一次原子发布
-- 验证 `atomic.Pointer` 并发读零竞态（race detector）
-
-### Phase F：EtcdModule facade 完善
-
-- 清理 `module.go` 对 `etcd_module/cluster` 的深度依赖
-- 对外方法通过注入的 Actors 实现
-- 集成测试：完整 start → register → watch → stop 流程
-
-### Phase G：cluster 层 kaCtx 热修复（独立，可随时合并）
-
-- `etcd_module/cluster/cluster.go`：`context.WithCancel(context.Background())` → `context.WithCancel(c.lifecycle.runCtx)`
-- 不依赖其他 Phase
-- 验证：`go test ./etcd_module/cluster/... -count=1`
-
----
-
-## 七、已确认约束与风险
-
-### 已确认约束
-
-| # | 决策 |
-|---|------|
-| D1 | LeaseActor 直接依赖 etcdClient 接口，并负责 `Grant/KeepAlive/Revoke` |
-| D2 | 注册来源为配置驱动（Init/Reload），不是 watch 自身 key 的反推 |
-| D3 | bypath / byname / byid 全部纳入导出快照，并共享同一个 lease 生命周期 |
-| D4 | Lease 变化或配置变化必须触发 Registration rebuild |
-
-### 风险
-
-| 风险 | 概率 | 影响 | 缓解措施 |
-|------|------|------|---------|
-| v2 LeaseActor 与 cluster `bindLeaseEventBridge` 并存导致双重注册 | 中 | 高 | v2 路径明确跳过 `bindLeaseEventBridge`；两者严格互斥 |
-| v2 直接用 etcdClient 后，cluster Tick 路径逻辑失效 | 低 | 中 | 过渡期 v2 仍走 cluster Tick；Phase F 时替换 |
-| RegistrationActor LeaseExpired 后不主动 Delete 导致 etcd 中短暂残留 | 低 | 低 | 依赖 etcd lease TTL GC，TTL 内残留是预期行为 |
-| ProjectionActor 快照替换频率过高造成 GC 压力 | 低 | 低 | 同 revision 消息合并批处理后一次性替换 |
-
-**回退策略**：每个 Phase 是独立可合并的 PR；Phase N 失败只回滚该 Phase，不影响已合并的前置 Phase。

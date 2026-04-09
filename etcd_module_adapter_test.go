@@ -8,7 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/protobuf/proto"
 
+	lu "github.com/atframework/atframe-utils-go/lang_utility"
+	log "github.com/atframework/atframe-utils-go/log"
 	modulev2 "github.com/atframework/libatapp-go/etcd_module_v2"
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
 )
@@ -143,61 +146,97 @@ func TestEtcdModuleAdapter_Reset_ClearsPrevSnap(t *testing.T) {
 
 // ── Reload lifecycle ──────────────────────────────────────────────────────
 
-// TestEtcdModuleAdapter_Reload_StopsOldImpl verifies that Reload() stops the
-// running EtcdModule and clears all state.
-// startAdapterWithImpl creates the adapter without an AppImpl owner, so
-// ensureImpl() finds no config after the teardown and leaves m.impl == nil.
-// The key assertion is that the old module transitions to stopped state.
-func TestEtcdModuleAdapter_Reload_StopsOldImpl(t *testing.T) {
-	a := startAdapterWithImpl(t)
+// TestEtcdModuleAdapter_Reload_Disabled_Silent 验证 enable=false 的 adapter
+// 处于静默状态：AddRegistration 不写入 etcd（返回 nil），但仍在本地缓存。
+func TestEtcdModuleAdapter_Reload_Disabled_Silent(t *testing.T) {
+	// Arrange: adapter 无 owner、无 impl（默认 enabled=false）
+	a := newEtcdModuleAdapter(nil)
 
-	// Capture the old impl before reload.
+	// Act: 尝试注册节点
+	reg := a.AddRegistrationDiscoveryActor(
+		&pb.AtappDiscovery{Id: 1, Name: "node-1"},
+		"/svc/by_id/1",
+	)
+
+	// Assert: 无 impl → 返回 nil，不写 etcd
+	assert.Nil(t, reg, "disabled adapter must return nil for AddRegistration")
+
+	// 节点仍被本地缓存（待 Reload 后重放）
 	a.mu.RLock()
-	oldImpl := a.impl
+	_, cached := a.registrations["/svc/by_id/1"]
+	impl := a.impl
 	a.mu.RUnlock()
-	require.NotNil(t, oldImpl, "impl must be running before Reload")
-
-	// Reload tears down old impl.  No AppImpl → ensureImpl creates nothing new.
-	err := a.Reload()
-	require.NoError(t, err)
-
-	// The old module must have been stopped; a second Stop returns ErrNotRunning.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	stopErr := oldImpl.Stop(ctx)
-	assert.Equal(t, modulev2.ErrNotRunning, stopErr,
-		"old impl must have been stopped by Reload")
+	assert.True(t, cached, "registration must be cached for later replay")
+	assert.Nil(t, impl, "impl must remain nil while disabled")
 }
 
-// TestEtcdModuleAdapter_Reload_ClearsPathCfg verifies that pathCfg is reset
-// so path accessors return empty strings after a Reload when no new config is
-// available.
-func TestEtcdModuleAdapter_Reload_ClearsPathCfg(t *testing.T) {
-	a := newEtcdModuleAdapter(nil)
-	a.mu.Lock()
-	a.pathCfg = modulev2.PathConfig{
-		ByIDPrefix: "/svc/by_id",
+// TestEtcdModuleAdapter_Reload_EnabledFromSilent_ReplaysRegistrations 验证
+// 从静默（enable=false）经 Init 后，配置切换为 enable=true 再调用 Reload，
+// adapter 正确完成 disabled→enabled 状态迁移，全程只经过 Init/Reload 两个生命周期入口。
+func TestEtcdModuleAdapter_Reload_EnabledFromSilent_ReplaysRegistrations(t *testing.T) {
+	// Arrange: owner 初始配置 enable=false
+	owner := &stubOwner{cfg: AppConfig{ConfigPb: &pb.AtappConfigure{
+		Etcd: &pb.AtappEtcd{Enable: false, Path: "/app/etcd"},
+	}}}
+	a := newEtcdModuleAdapter(owner)
+
+	// Init：ensureImpl 缓存 etcdCfg（enable=false），不创建 impl
+	require.NoError(t, a.Init(context.Background()))
+	require.Nil(t, a.impl, "impl must remain nil while disabled")
+	require.False(t, a.IsEtcdEnabled(), "adapter must be disabled after Init with enable=false")
+
+	// 外部配置变更（模拟 signal → atapp.Reload 读到的新配置）
+	owner.cfg.ConfigPb.Etcd.Enable = true
+
+	// Act: 信号驱动的 Reload
+	err := a.Reload()
+
+	// Assert: 无错误，adapter 状态切换为 enabled
+	assert.NoError(t, err)
+	assert.True(t, a.IsEtcdEnabled(), "adapter should be enabled after Reload")
+}
+
+// TestEtcdModuleAdapter_Reload_UpdatedRegistration_NewDataTakesEffect 验证
+// 修改本地缓存中节点数据后调用 Reload，etcd 侧先反注册旧数据再注册新数据，
+// 即修改后的信息在 Reload 后生效。
+func TestEtcdModuleAdapter_Reload_UpdatedRegistration_NewDataTakesEffect(t *testing.T) {
+	// Arrange: owner 初始配置含 V1 应用名称（atapp_configure.name 映射到 atapp_discovery.name）
+	owner := &stubOwner{
+		id: 1,
+		cfg: AppConfig{ConfigPb: &pb.AtappConfigure{
+			Name: "node-v1",
+			Etcd: &pb.AtappEtcd{Enable: true, Path: "/app/etcd"},
+		}},
 	}
+	pathCfg := modulev2.PathConfig{
+		ByIDPrefix: "/svc/by_id",
+		LeaseTTL:   10,
+	}
+	opts := modulev2.ModuleOptions{RetryInterval: 50 * time.Millisecond}
+	impl := modulev2.NewEtcdModule(&adapterMockClient{}, pathCfg, opts)
+	require.NoError(t, impl.Start(context.Background()))
+	t.Cleanup(func() { _ = impl.Stop(context.Background()) })
+
+	a := newEtcdModuleAdapter(owner)
+	a.mu.Lock()
+	a.impl = impl
+	a.pathCfg = pathCfg
+	a.etcdCfg = &pb.AtappEtcd{Enable: true, Path: "/app/etcd"}
+	a.enabled = true
 	a.mu.Unlock()
 
+	owner.cfg.ConfigPb.Name = "node-v2"
+
+	// Act: Reload → unregisterAll + replayRegistrations（读缓存中已更新的 discovery 指针）
 	err := a.Reload()
-	require.NoError(t, err)
 
-	assert.Equal(t, "", a.GetDiscoveryByIdPath(),
-		"ByIDPrefix must be cleared by Reload when no new config is available")
-}
-
-// TestEtcdModuleAdapter_Reload_ClearsPrevSnap verifies that prevSnap is
-// cleared by Reload, preventing stale diff state leaking into the new module.
-func TestEtcdModuleAdapter_Reload_ClearsPrevSnap(t *testing.T) {
-	a := newEtcdModuleAdapter(nil)
-	a.onSnapshotPublished(makeDiscSnap(discNode("/by_id/1", 1, "n")))
-	require.NotNil(t, a.prevSnap.Load(), "prevSnap must be set before Reload")
-
-	err := a.Reload()
-	require.NoError(t, err)
-
-	assert.Nil(t, a.prevSnap.Load(), "prevSnap must be nil after Reload")
+	// Assert: 无错误，缓存中保留 V2 数据
+	assert.NoError(t, err)
+	a.mu.RLock()
+	svc := a.registrations["/svc/by_id/1"]
+	a.mu.RUnlock()
+	assert.Equal(t, "node-v2", svc.Discovery.GetName(),
+		"registration cache must contain updated V2 data after Reload")
 }
 
 // ── callback handle allocation ─────────────────────────────────────────────
@@ -321,6 +360,24 @@ func TestEtcdModuleAdapter_RemoveOnNodeEvent_StopsDispatch(t *testing.T) {
 	a.RemoveOnNodeEvent(h)
 	a.onSnapshotPublished(makeDiscSnap(discNode("/svc/by_id/2", 2, "n")))
 	assert.Equal(t, 1, count, "callback must not fire after removal")
+}
+
+// TestEtcdModuleAdapter_NodeDiscoveryEvent_MultiCallbacks_FiredInOrder 对应 C++ I.4.9
+// discovery_event_multi_callbacks：注册 3 个回调，触发一次节点事件后，
+// 三个回调必须全部触发，且触发顺序与注册顺序一致。
+func TestEtcdModuleAdapter_NodeDiscoveryEvent_MultiCallbacks_FiredInOrder(t *testing.T) {
+	// ── Arrange ───────────────────────────────────────────────────────────
+	a := newEtcdModuleAdapter(nil)
+	callOrder := make([]int, 0, 3)
+	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) { callOrder = append(callOrder, 1) })
+	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) { callOrder = append(callOrder, 2) })
+	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) { callOrder = append(callOrder, 3) })
+
+	// ── Act ───────────────────────────────────────────────────────────────
+	a.onSnapshotPublished(makeDiscSnap(discNode("/svc/by_id/1", 1, "node-1")))
+
+	// ── Assert ────────────────────────────────────────────────────────────
+	assert.Equal(t, []int{1, 2, 3}, callOrder, "3个回调必须按注册顺序全部触发")
 }
 
 // ── core path: Discovery watcher callbacks ────────────────────────────────
@@ -551,6 +608,25 @@ func TestEtcdModuleAdapter_TopologyUpdate_ContentUnchanged_SuppressesCallback(t 
 	assert.False(t, called, "identical content must not fire callback")
 }
 
+// TestEtcdModuleAdapter_TopologyInfoEvent_MultiCallbacks_FiredSameCount 对应 C++ I.4.13
+// topology_event_multi_callbacks：注册 2 个拓扑回调，触发同一拓扑节点事件后，
+// 两个回调触发次数必须相同。
+func TestEtcdModuleAdapter_TopologyInfoEvent_MultiCallbacks_FiredSameCount(t *testing.T) {
+	// ── Arrange ───────────────────────────────────────────────────────────
+	a := newEtcdModuleAdapter(nil)
+	var cb1Count, cb2Count int
+	a.AddOnTopologyInfoEvent(func(EtcdWatchEvent, *pb.AtappTopologyInfo, *EtcdDataVersion) { cb1Count++ })
+	a.AddOnTopologyInfoEvent(func(EtcdWatchEvent, *pb.AtappTopologyInfo, *EtcdDataVersion) { cb2Count++ })
+	baseline1, baseline2 := cb1Count, cb2Count
+
+	// ── Act ───────────────────────────────────────────────────────────────
+	a.onSnapshotPublished(makeTopoSnap(topoNode(100, "svc-multi")))
+
+	// ── Assert ────────────────────────────────────────────────────────────
+	assert.Equal(t, cb1Count-baseline1, cb2Count-baseline2, "两个拓扑回调触发次数必须相同")
+	assert.Equal(t, 1, cb1Count-baseline1, "回调必须至少触发一次")
+}
+
 func TestEtcdModuleAdapter_TopologyWatcher_FiredOnTopologyUp(t *testing.T) {
 	a := newEtcdModuleAdapter(nil)
 
@@ -637,6 +713,58 @@ func TestEtcdModuleAdapter_GetTopologyInfoSet_ReturnsEmptyMap_NoImpl(t *testing.
 }
 
 // ── live-impl helpers ─────────────────────────────────────────────────────
+
+// stubOwner is a minimal AppImpl for Reload lifecycle tests.
+// Only GetConfig() is meaningful; all other methods are no-op stubs.
+// Set the id field to a non-zero value when tests need GetId() != 0.
+type stubOwner struct {
+	cfg AppConfig
+	id  uint64
+}
+
+func (s *stubOwner) GetConfig() *AppConfig                               { return &s.cfg }
+func (s *stubOwner) Run(_ []string) error                                { return nil }
+func (s *stubOwner) Init(_ []string) error                               { return nil }
+func (s *stubOwner) RunOnce(_ *time.Ticker) error                        { return nil }
+func (s *stubOwner) Stop() error                                         { return nil }
+func (s *stubOwner) Reload() error                                       { return nil }
+func (s *stubOwner) GetId() uint64                                       { return s.id }
+func (s *stubOwner) GetTypeId() uint64                                   { return 0 }
+func (s *stubOwner) GetTypeName() string                                 { return "" }
+func (s *stubOwner) GetAppName() string                                  { return "" }
+func (s *stubOwner) GetAppIdentity() string                              { return "" }
+func (s *stubOwner) GetHashCode() string                                 { return "" }
+func (s *stubOwner) GetAppVersion() string                               { return "" }
+func (s *stubOwner) GetBuildVersion() string                             { return "" }
+func (s *stubOwner) GetConfigFile() string                               { return "" }
+func (s *stubOwner) GetSysNow() time.Time                                { return time.Time{} }
+func (s *stubOwner) AddModule(_ lu.TypeID, _ AppModuleImpl) error        { return nil }
+func (s *stubOwner) GetModule(_ lu.TypeID) AppModuleImpl                 { return nil }
+func (s *stubOwner) SendMessage(_ uint64, _ int32, _ []byte) error       { return nil }
+func (s *stubOwner) SendMessageByName(_ string, _ int32, _ []byte) error { return nil }
+func (s *stubOwner) SetEventHandler(_ string, _ EventHandler)            {}
+func (s *stubOwner) TriggerEvent(_ string, _ *AppActionSender) int       { return 0 }
+func (s *stubOwner) PushAction(_ func(*AppActionData) error, _ []byte, _ interface{}) error {
+	return nil
+}
+func (s *stubOwner) LoadConfig(_ string, _ string, _ string, _ *ConfigExistedIndex) error {
+	return nil
+}
+func (s *stubOwner) LoadConfigByPath(_ proto.Message, _ string, _ string, _ *ConfigExistedIndex, _ string) error {
+	return nil
+}
+func (s *stubOwner) LoadLogConfigByPath(_ *pb.AtappLog, _ string, _ string, _ *ConfigExistedIndex, _ string) error {
+	return nil
+}
+func (s *stubOwner) IsInited() bool                 { return false }
+func (s *stubOwner) IsRunning() bool                { return false }
+func (s *stubOwner) IsClosing() bool                { return false }
+func (s *stubOwner) IsClosed() bool                 { return false }
+func (s *stubOwner) CheckFlag(_ AppFlag) bool       { return false }
+func (s *stubOwner) SetFlag(_ AppFlag, _ bool) bool { return false }
+func (s *stubOwner) GetAppContext() context.Context { return context.Background() }
+func (s *stubOwner) GetDefaultLogger() *log.Logger  { return nil }
+func (s *stubOwner) GetLogger(_ int) *log.Logger    { return nil }
 
 // adapterMockClient is a minimal EtcdClient implementation for adapter tests
 // that require a running EtcdModule.  All operations return immediate success.
@@ -1454,19 +1582,39 @@ func TestEtcdModuleAdapter_PathAccessors_ReturnPathCfgValues(t *testing.T) {
 	assert.Equal(t, "/svc/topology", a.GetTopologyPath())
 }
 
-func TestEtcdModuleAdapter_WatcherPaths_DelegateToBasePaths(t *testing.T) {
+// TestEtcdModuleAdapter_WatcherPaths 对应 C++ I.4.3 (watcher_paths)：
+// watcher path = GetConfigurePath() + "/" + const_dir，不含节点特定后缀，
+// 因此长度小于 keepalive path（keepalive path = ByIDPrefix + "/<name>-<id>"）。
+//
+// Go 实现直接拼接常量目录名，与 C++ 定义完全一致：
+//
+//	get_discovery_by_id_watcher_path()   → configure_path + "by_id"
+//	get_discovery_by_name_watcher_path() → configure_path + "by_name"
+//	get_topology_watcher_path()          → configure_path + "topology"
+func TestEtcdModuleAdapter_WatcherPaths(t *testing.T) {
 	a := newEtcdModuleAdapter(nil)
 	a.mu.Lock()
-	a.pathCfg = modulev2.PathConfig{
-		ByIDPrefix:     "/w/by_id",
-		ByNamePrefix:   "/w/by_name",
-		TopologyPrefix: "/w/topo",
-	}
+	a.etcdCfg = &pb.AtappEtcd{Path: "/svc"}
 	a.mu.Unlock()
 
-	assert.Equal(t, a.GetDiscoveryByIdPath(), a.GetDiscoveryByIdWatcherPath())
-	assert.Equal(t, a.GetDiscoveryByNamePath(), a.GetDiscoveryByNameWatcherPath())
-	assert.Equal(t, a.GetTopologyPath(), a.GetTopologyWatcherPath())
+	assert.Equal(t, "/svc/by_id", a.GetDiscoveryByIdWatcherPath())
+	assert.Equal(t, "/svc/by_name", a.GetDiscoveryByNameWatcherPath())
+	assert.Equal(t, "/svc/topology", a.GetTopologyWatcherPath())
+
+	// watcher path 是前缀，注册路径在前缀下再追加 "/<name>-<id>"。
+	// 对应 C++ 断言：watcher.size() < keepalive.size()
+	assert.Less(t, len(a.GetDiscoveryByIdWatcherPath()), len("/svc/by_id/myapp-123"))
+}
+
+// TestEtcdModuleAdapter_WatcherPaths_EmptyConfigurePath 验证 etcdCfg 未设置时
+// 回退行为：返回 "/by_id" 等（configure_path 为空字符串 + "/dir"）。
+func TestEtcdModuleAdapter_WatcherPaths_EmptyConfigurePath(t *testing.T) {
+	a := newEtcdModuleAdapter(nil)
+	// etcdCfg 为 nil → GetConfigurePath() 返回 ""
+
+	assert.Equal(t, "/by_id", a.GetDiscoveryByIdWatcherPath())
+	assert.Equal(t, "/by_name", a.GetDiscoveryByNameWatcherPath())
+	assert.Equal(t, "/topology", a.GetTopologyWatcherPath())
 }
 
 // ── RemoveOnTopologyInfoEvent ─────────────────────────────────────────────

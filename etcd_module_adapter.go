@@ -2,10 +2,11 @@ package libatapp
 
 import (
 	"context"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	modulev2 "github.com/atframework/libatapp-go/etcd_module_v2"
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
@@ -129,7 +130,54 @@ func (m *etcdModuleAdapter) ensureImpl() error {
 	m.impl = etcdModule
 	// Derive pathCfg from the module itself to guarantee single source of truth.
 	m.pathCfg = etcdModule.GetPathConfig()
+	// Populate self-registration from the app's own config.
+	m.populateRegistrationsLocked(cfg.ConfigPb)
 	return nil
+}
+
+// populateRegistrationsLocked rebuilds m.registrations with the app's own
+// self-registration data derived from appCfg (by-id and by-name paths).
+// Must be called with m.mu held; m.pathCfg must already be set.
+func (m *etcdModuleAdapter) populateRegistrationsLocked(appCfg *pb.AtappConfigure) {
+	owner := m.GetApp()
+	if owner == nil || appCfg == nil {
+		return
+	}
+	id := owner.GetId()
+	if id == 0 {
+		return
+	}
+	// Use appCfg.GetName() so Reload always reflects the latest config name.
+	name := appCfg.GetName()
+	disc := &pb.AtappDiscovery{
+		Id:         id,
+		Name:       name,
+		TypeId:     owner.GetTypeId(),
+		TypeName:   owner.GetTypeName(),
+		HashCode:   owner.GetHashCode(),
+		Version:    owner.GetAppVersion(),
+		Identity:   owner.GetAppIdentity(),
+		CustomData: m.customData,
+		Hostname:   appCfg.GetHostname(),
+		Pid:        int32(os.Getpid()),
+		Area:       appCfg.GetArea(),
+		Metadata:   appCfg.GetMetadata(),
+	}
+	if bus := appCfg.GetBus(); bus != nil {
+		disc.Listen = bus.GetListen()
+		disc.Gateways = bus.GetGateways()
+	}
+	idStr := strconv.FormatUint(id, 10)
+	// by-id key is keyed purely by the numeric id (id is the unique identifier).
+	if m.pathCfg.ByIDPrefix != "" {
+		path := m.pathCfg.ByIDPrefix + "/" + idStr
+		m.registrations[path] = modulev2.ServiceInfo{Path: path, Discovery: disc}
+	}
+	// by-name key includes name for human readability and disambiguation.
+	if m.pathCfg.ByNamePrefix != "" {
+		path := m.pathCfg.ByNamePrefix + "/" + name + "-" + idStr
+		m.registrations[path] = modulev2.ServiceInfo{Path: path, Discovery: disc}
+	}
 }
 
 // ── AppModuleImpl ─────────────────────────────────────────────────────────
@@ -146,7 +194,12 @@ func (m *etcdModuleAdapter) Init(parent context.Context) error {
 	if impl == nil {
 		return nil
 	}
-	return m.startImpl(parent, impl)
+
+	if m.IsEnabled() {
+		return m.startImpl(parent, impl)
+	} else {
+		return nil // Module is disabled; do not start, but Init is still successful.
+	}
 }
 
 // startImpl starts impl and replays all pending registrations from the cache.
@@ -191,94 +244,55 @@ func (m *etcdModuleAdapter) replayRegistrations(ctx context.Context, impl *modul
 	return nil
 }
 
+// 讨论确定 只做自己数据的 提交更新，不会去修改watcher 和 链接信息。
 func (m *etcdModuleAdapter) Reload() error {
-	// Classify the change: does it require Stop+Start (hard) or just endpoint
-	// update (soft)?  Soft is preferred because it preserves the lease and
-	// keeps watch streams live.
 	owner := m.GetApp()
-	var newEtcdCfg *pb.AtappEtcd
-	if owner != nil {
-		if cfg := owner.GetConfig(); cfg != nil && cfg.ConfigPb != nil {
-			newEtcdCfg = cfg.ConfigPb.GetEtcd()
-		}
+	if owner == nil {
+		return nil
+	}
+	cfg := owner.GetConfig()
+	if cfg == nil || cfg.ConfigPb == nil {
+		return nil
+	}
+	newEtcdCfg := cfg.ConfigPb.GetEtcd()
+
+	// 判定enable状态变化 关->开
+	if m.etcdCfg == nil && newEtcdCfg != nil && newEtcdCfg.GetEnable() {
+		return m.Init(context.Background())
 	}
 
-	m.mu.RLock()
-	oldEtcdCfg := m.etcdCfg
-	impl := m.impl
-	m.mu.RUnlock()
-
-	if etcdHardReloadRequired(oldEtcdCfg, newEtcdCfg) {
-		return m.hardReload()
-	}
-
-	// ── Soft path ────────────────────────────────────────────────────────
-	// TLS, auth, base path and the enable flag are unchanged.
-	// Only hosts list (and/or timing params) may differ.
 	m.mu.Lock()
+	// Snapshot old paths so we can unregister them from etcd after clearing.
+	oldPaths := make([]string, 0, len(m.registrations))
+	for path := range m.registrations {
+		oldPaths = append(oldPaths, path)
+	}
+	// Refresh config, clear stale registrations, and rebuild from new config.
+	clear(m.registrations)
 	m.etcdCfg = newEtcdCfg
-	m.mu.Unlock()
-
-	if impl == nil {
-		return nil
+	if newEtcdCfg != nil {
+		m.enabled = newEtcdCfg.GetEnable()
 	}
-	if newHosts := newEtcdCfg.GetHosts(); len(newHosts) > 0 {
-		err := impl.UpdateEndpoints(newHosts)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// hardReload tears down the running impl and all cached state, then re-creates
-// it from the current app config.  Use when TLS, auth, base path, or the
-// enable flag changes — scenarios that cannot be hot-swapped on a live client.
-func (m *etcdModuleAdapter) hardReload() error {
-	m.mu.Lock()
 	impl := m.impl
-	oldPathCfg := m.pathCfg
-	m.impl = nil
-	m.etcdCfg = nil
-	m.pathCfg = modulev2.PathConfig{}
+	if impl != nil && newEtcdCfg != nil && newEtcdCfg.GetEnable() {
+		m.populateRegistrationsLocked(cfg.ConfigPb)
+	}
 	m.mu.Unlock()
 
-	m.prevSnap.Store(nil)
+	ctx := context.Background()
 
+	// Unregister old paths from etcd.
 	if impl != nil {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer stopCancel()
-		err := impl.Stop(stopCtx)
-		if err != nil {
-			return err
+		for _, path := range oldPaths {
+			_ = impl.UnregisterService(ctx, path)
 		}
 	}
-
-	// Re-create from current config (no-op when there is no owner or the
-	// module is disabled in the new config).
-	if err := m.ensureImpl(); err != nil {
-		return err
-	}
-
-	// If the path prefixes changed the cached ServiceInfo.Path values are
-	// stale (they embed the old prefix).  Clear them so that replayRegistrations
-	// does not write ghost keys under the new lease; the application layer will
-	// re-register with paths built from the new prefix.
-	m.mu.Lock()
-	newPathCfg := m.pathCfg
-	newImpl := m.impl
-	if oldPathCfg.ByIDPrefix != newPathCfg.ByIDPrefix ||
-		oldPathCfg.ByNamePrefix != newPathCfg.ByNamePrefix ||
-		oldPathCfg.TopologyPrefix != newPathCfg.TopologyPrefix {
-		m.registrations = make(map[string]modulev2.ServiceInfo)
-	}
-	m.mu.Unlock()
-
-	if newImpl == nil {
+	if newEtcdCfg == nil || !newEtcdCfg.GetEnable() {
 		return nil
 	}
-	return m.startImpl(context.Background(), newImpl)
+	return m.replayRegistrations(ctx, impl)
 }
+
 
 func (m *etcdModuleAdapter) Stop() (bool, error) {
 	m.mu.RLock()
@@ -412,15 +426,15 @@ func (m *etcdModuleAdapter) GetTopologyPath() string {
 }
 
 func (m *etcdModuleAdapter) GetDiscoveryByIdWatcherPath() string {
-	return m.GetDiscoveryByIdPath()
+	return m.GetConfigurePath() + "/" + modulev2.ByIDDir
 }
 
 func (m *etcdModuleAdapter) GetDiscoveryByNameWatcherPath() string {
-	return m.GetDiscoveryByNamePath()
+	return m.GetConfigurePath() + "/" + modulev2.ByNameDir
 }
 
 func (m *etcdModuleAdapter) GetTopologyWatcherPath() string {
-	return m.GetTopologyPath()
+	return m.GetConfigurePath() + "/" + modulev2.TopologyDir
 }
 
 // ── EtcdModuleImpl — watcher callbacks ───────────────────────────────────
@@ -461,7 +475,10 @@ func (m *etcdModuleAdapter) AddRegistrationDiscoveryActor(val *pb.AtappDiscovery
 	if val == nil {
 		return nil
 	}
-	svc := modulev2.ServiceInfo{Discovery: val, Path: nodePath}
+	svc := modulev2.ServiceInfo{
+		Discovery: val,
+		Path:      nodePath,
+	}
 
 	m.mu.Lock()
 	m.registrations[nodePath] = svc
@@ -476,7 +493,7 @@ func (m *etcdModuleAdapter) AddRegistrationDiscoveryActor(val *pb.AtappDiscovery
 		return nil
 	}
 	if err = h.Wait(context.Background()); err != nil {
-		return nil
+		return &EtcdRegistration{path: nodePath, Err: err}
 	}
 	return &EtcdRegistration{path: nodePath}
 }
@@ -500,7 +517,7 @@ func (m *etcdModuleAdapter) AddRegistrationTopologyActor(val *pb.AtappTopologyIn
 		return nil
 	}
 	if err = h.Wait(context.Background()); err != nil {
-		return nil
+		return &EtcdRegistration{path: nodePath, Err: err}
 	}
 	return &EtcdRegistration{path: nodePath}
 }

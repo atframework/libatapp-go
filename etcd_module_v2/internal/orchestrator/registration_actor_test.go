@@ -10,9 +10,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
 
+	"github.com/atframework/libatapp-go/etcd_module_v2/internal/codec"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/runtime"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/snapshot"
 )
@@ -543,3 +545,272 @@ func TestRegistrationActor_Snapshot_Clone_IncludesTopology(t *testing.T) {
 	delete(cloned.TopologyServices, "/topology/svc-1")
 	assert.Len(t, orig.TopologyServices, 1)
 }
+
+// ── Checker tests ─────────────────────────────────────────────────────────
+
+// registrationCheckerClient extends the basic test client with controllable
+// Get responses, mirroring C++ etcd_keepalive checker GET semantics.
+type registrationCheckerClient struct {
+	registrationActorTestClient
+	mu       sync.Mutex
+	getReply map[string]string // key → current value ("" = key absent)
+}
+
+func (c *registrationCheckerClient) Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+	c.mu.Lock()
+	val, ok := c.getReply[key]
+	c.mu.Unlock()
+	if !ok || val == "" {
+		return &clientv3.GetResponse{}, nil
+	}
+	return &clientv3.GetResponse{
+		Kvs: []*mvccpb.KeyValue{
+			{Key: []byte(key), Value: []byte(val)},
+		},
+	}, nil
+}
+
+// TestRegistrationActor_Checker_Conflict mirrors C++ I.2.4 keepalive_checker_conflict:
+// another process owns the key → checker rejects → ErrCheckerConflict is returned
+// and no PUT is issued for that key.
+func TestRegistrationActor_Checker_Conflict(t *testing.T) {
+	// Arrange
+	client := &registrationCheckerClient{
+		getReply: map[string]string{
+			"/svc/by_path/svc-c": "other-app-value",
+		},
+	}
+	bus := runtime.NewEventBus()
+	actor := NewRegistrationActor(client, bus,
+		"/svc/by_name/", "/svc/by_id/", "/svc/topology")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	grantLeaseAndWait(t, actor, &client.registrationActorTestClient, bus, 9001, 1)
+
+	// Act: register with checker expecting "my-value", but etcd has "other-app-value"
+	err := <-actor.AddDiscovery(ctx,
+		&pb.AtappDiscovery{Id: 1, Name: "svc-c"},
+		"/svc/by_path/svc-c", 16,
+		DefaultChecker("my-value"),
+	)
+
+	// Assert: checker conflict → ErrCheckerConflict, no PUT issued
+	assert.ErrorIs(t, err, ErrCheckerConflict, "should return ErrCheckerConflict")
+	assert.Zero(t, client.countPutKey("/svc/by_path/svc-c"),
+		"by-path key must NOT be written on conflict")
+}
+
+// TestRegistrationActor_Checker_SameIdentity mirrors C++ I.2.5 keepalive_checker_same_identity:
+// the etcd key already holds our own value (restart) → checker passes → registration succeeds.
+func TestRegistrationActor_Checker_SameIdentity(t *testing.T) {
+	// Arrange
+	const myValue = `{"id":2,"name":"svc-d"` // partial match; the checker sees the full JSON
+	// Simulate etcd already holding a value that the checker recognises.
+	// We use DefaultChecker with a sentinel that always matches to keep the
+	// test deterministic without encoding the full JSON value.
+	sameValue := "sentinel-same-identity"
+	client := &registrationCheckerClient{
+		getReply: map[string]string{
+			"/svc/by_path/svc-d": sameValue,
+		},
+	}
+	bus := runtime.NewEventBus()
+	actor := NewRegistrationActor(client, bus,
+		"/svc/by_name/", "/svc/by_id/", "/svc/topology")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	grantLeaseAndWait(t, actor, &client.registrationActorTestClient, bus, 9002, 1)
+
+	// Act: register with checker matching the existing value
+	err := <-actor.AddDiscovery(ctx,
+		&pb.AtappDiscovery{Id: 2, Name: "svc-d"},
+		"/svc/by_path/svc-d", 16,
+		DefaultChecker(sameValue),
+	)
+
+	// Assert: checker passes → registration succeeds, PUT is issued
+	assert.NoError(t, err, "same-identity checker should allow registration")
+	assert.Positive(t, client.countPutKey("/svc/by_path/svc-d"),
+		"by-path key must be written on same-identity pass")
+}
+
+// TestRegistrationActor_Checker_NoPreexistingKey verifies that DefaultChecker
+// allows fresh registration when the key does not yet exist (empty string case).
+func TestRegistrationActor_Checker_NoPreexistingKey(t *testing.T) {
+	// Arrange: Get returns empty (key absent)
+	client := &registrationCheckerClient{
+		getReply: map[string]string{}, // no entries → key absent
+	}
+	bus := runtime.NewEventBus()
+	actor := NewRegistrationActor(client, bus,
+		"/svc/by_name/", "/svc/by_id/", "/svc/topology")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	grantLeaseAndWait(t, actor, &client.registrationActorTestClient, bus, 9003, 1)
+
+	// Act
+	err := <-actor.AddDiscovery(ctx,
+		&pb.AtappDiscovery{Id: 3, Name: "svc-e"},
+		"/svc/by_path/svc-e", 16,
+		DefaultChecker("my-expected-value"),
+	)
+
+	// Assert: key absent → checker passes, PUT issued
+	assert.NoError(t, err)
+	assert.Positive(t, client.countPutKey("/svc/by_path/svc-e"))
+}
+
+// TestRegistrationActor_Checker_RunOncePerLeaseEpoch verifies that the checker
+// runs exactly once within a lease epoch and is re-run after lease rebuild.
+func TestRegistrationActor_Checker_RunOncePerLeaseEpoch(t *testing.T) {
+	// Arrange: key absent initially → checker passes on first epoch.
+	client := &registrationCheckerClient{
+		getReply: map[string]string{},
+	}
+	bus := runtime.NewEventBus()
+	actor := NewRegistrationActor(client, bus,
+		"/svc/by_name/", "/svc/by_id/", "/svc/topology")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	// Epoch 1: lease granted, checker runs (key absent → passes).
+	grantLeaseAndWait(t, actor, &client.registrationActorTestClient, bus, 9004, 1)
+
+	err := <-actor.AddDiscovery(ctx,
+		&pb.AtappDiscovery{Id: 4, Name: "svc-f"},
+		"/svc/by_path/svc-f", 16,
+		DefaultChecker("owner-value"),
+	)
+	require.NoError(t, err)
+	putsAfterEpoch1 := client.countPutKey("/svc/by_path/svc-f")
+	assert.Positive(t, putsAfterEpoch1)
+
+	// Simulate lease expiry then new lease — checker should re-run (checkerRun is reset).
+	// Put a conflicting value so that if checker re-ran it would fail.
+	client.mu.Lock()
+	client.getReply["/svc/by_path/svc-f"] = "conflicting-other-owner"
+	client.mu.Unlock()
+
+	publishLeaseExpired(bus, 1)
+	// Give the actor a moment to process lease expired.
+	time.Sleep(50 * time.Millisecond)
+
+	// Epoch 2: new lease — checker re-runs and should fail.
+	grantLeaseAndWait(t, actor, &client.registrationActorTestClient, bus, 9005, 2)
+
+	// The replay should fail with ErrCheckerConflict.  Since this hits the
+	// replay path (not AddDiscovery directly), we observe via PUT count: no
+	// additional PUTs for the key should occur.
+	time.Sleep(100 * time.Millisecond)
+	putsAfterEpoch2 := client.countPutKey("/svc/by_path/svc-f")
+	assert.Equal(t, putsAfterEpoch1, putsAfterEpoch2,
+		"no additional PUT should occur when checker conflicts on new lease epoch")
+}
+
+// ── Topology checker tests ────────────────────────────────────────────────
+
+// TestRegistrationActor_TopologyChecker_Conflict verifies that a topology key
+// owned by another instance is rejected (ErrCheckerConflict), no PUT issued.
+func TestRegistrationActor_TopologyChecker_Conflict(t *testing.T) {
+	topoInfo := &pb.AtappTopologyInfo{Id: 10, Name: "topo-a"}
+	topoKey := "/svc/topology/topo-a-10"
+
+	client := &registrationCheckerClient{
+		getReply: map[string]string{
+			topoKey: "other-owner-value",
+		},
+	}
+	bus := runtime.NewEventBus()
+	actor := NewRegistrationActor(client, bus,
+		"/svc/by_name/", "/svc/by_id/", "/svc/topology")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	grantLeaseAndWait(t, actor, &client.registrationActorTestClient, bus, 9010, 1)
+
+	err := <-actor.AddTopology(ctx, topoInfo, "/svc/by_path/topo-a", 16,
+		DefaultChecker("my-own-value"),
+	)
+
+	assert.ErrorIs(t, err, ErrCheckerConflict,
+		"topology checker should return ErrCheckerConflict when key is owned by another instance")
+	assert.Zero(t, client.countPutKey(topoKey),
+		"topology key must NOT be written on conflict")
+}
+
+// TestRegistrationActor_TopologyChecker_SameIdentity verifies that a topology
+// key already holding our own JSON (same-identity restart) is allowed through.
+func TestRegistrationActor_TopologyChecker_SameIdentity(t *testing.T) {
+	topoInfo := &pb.AtappTopologyInfo{Id: 11, Name: "topo-b"}
+	topoKey := "/svc/topology/topo-b-11"
+
+	// Encode the exact value the actor will PUT so the checker recognises it.
+	ownBytes, err := codec.MarshalTopologyToJSON(topoInfo)
+	require.NoError(t, err)
+	ownValue := string(ownBytes)
+
+	client := &registrationCheckerClient{
+		getReply: map[string]string{
+			topoKey: ownValue, // etcd already holds our own JSON
+		},
+	}
+	bus := runtime.NewEventBus()
+	actor := NewRegistrationActor(client, bus,
+		"/svc/by_name/", "/svc/by_id/", "/svc/topology")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	grantLeaseAndWait(t, actor, &client.registrationActorTestClient, bus, 9011, 1)
+
+	err = <-actor.AddTopology(ctx, topoInfo, "/svc/by_path/topo-b", 16,
+		DefaultChecker(ownValue),
+	)
+
+	assert.NoError(t, err, "same-identity topology checker should allow registration")
+	assert.Positive(t, client.countPutKey(topoKey),
+		"topology key must be written when checker passes on same-identity value")
+}
+
+// TestRegistrationActor_TopologyChecker_NoPreexistingKey verifies that a
+// topology key that does not yet exist (key absent) is allowed through.
+func TestRegistrationActor_TopologyChecker_NoPreexistingKey(t *testing.T) {
+	topoInfo := &pb.AtappTopologyInfo{Id: 12, Name: "topo-c"}
+	topoKey := "/svc/topology/topo-c-12"
+
+	client := &registrationCheckerClient{
+		getReply: map[string]string{}, // key absent
+	}
+	bus := runtime.NewEventBus()
+	actor := NewRegistrationActor(client, bus,
+		"/svc/by_name/", "/svc/by_id/", "/svc/topology")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go actor.Run(ctx)
+
+	grantLeaseAndWait(t, actor, &client.registrationActorTestClient, bus, 9012, 1)
+
+	err := <-actor.AddTopology(ctx, topoInfo, "/svc/by_path/topo-c", 16,
+		DefaultChecker("any-expected-value"),
+	)
+
+	assert.NoError(t, err, "fresh topology key should be allowed")
+	assert.Positive(t, client.countPutKey(topoKey),
+		"topology key must be written when key is absent")
+}
+

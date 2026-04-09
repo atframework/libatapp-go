@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/atframework/libatapp-go/etcd_module_v2/internal/pathbuilder"
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -88,11 +89,15 @@ func NewEtcdModuleFromConfigWithClient(cfg *pb.AtappEtcd, etcdClient *clientv3.C
 	}
 
 	pathCfg := PathConfig{
-		ByNamePrefix:   basePath + "/by_name",
-		ByIDPrefix:     basePath + "/by_id",
-		TopologyPrefix: basePath + "/topology",
-		WatchPrefixes:  []string{basePath + "/by_id", basePath + "/by_name", basePath + "/topology"},
-		LeaseTTL:       leaseTTL,
+		ByNamePrefix:   basePath + "/" + pathbuilder.ByNameDir,
+		ByIDPrefix:     basePath + "/" + pathbuilder.ByIDDir,
+		TopologyPrefix: basePath + "/" + pathbuilder.TopologyDir,
+		WatchPrefixes: []string{
+			basePath + "/" + pathbuilder.ByIDDir,
+			basePath + "/" + pathbuilder.ByNameDir,
+			basePath + "/" + pathbuilder.TopologyDir,
+		},
+		LeaseTTL: leaseTTL,
 	}
 	return NewEtcdModule(conn, pathCfg, opts), nil
 }

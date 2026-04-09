@@ -15,8 +15,10 @@ import (
 
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
 
+	"github.com/atframework/libatapp-go/etcd_module_v2/internal/codec"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/etcdversion"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/orchestrator"
+	"github.com/atframework/libatapp-go/etcd_module_v2/internal/pathbuilder"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/runtime"
 	"github.com/atframework/libatapp-go/etcd_module_v2/internal/snapshot"
 )
@@ -52,6 +54,15 @@ const (
 	SnapshotCauseReset     = snapshot.SnapshotCauseReset
 	SnapshotCauseDiscovery = snapshot.SnapshotCauseDiscovery
 	SnapshotCauseTopology  = snapshot.SnapshotCauseTopology
+)
+
+// ── etcd key directory name constants ─────────────────────────────────────
+// These mirror the C++ ETCD_MODULE_BY_ID_DIR / BY_NAME_DIR / TOPOLOGY_DIR
+// macros and are used to build watcher paths and path prefixes consistently.
+const (
+	ByIDDir     = pathbuilder.ByIDDir
+	ByNameDir   = pathbuilder.ByNameDir
+	TopologyDir = pathbuilder.TopologyDir
 )
 
 // ── Watcher callback types ────────────────────────────────────────────────
@@ -117,6 +128,58 @@ func (c PathConfig) Validate() PathConfig {
 
 // ── ServiceInfo ───────────────────────────────────────────────────────────
 
+// RegistrationChecker is the public alias for the write-before-check predicate.
+// See orchestrator.CheckerFn and DefaultRegistrationChecker for details.
+type RegistrationChecker = orchestrator.CheckerFn
+
+// ErrCheckerConflict is returned by RegisterService when a RegistrationChecker
+// rejects the current etcd value (key owned by another instance).
+var ErrCheckerConflict = orchestrator.ErrCheckerConflict
+
+// DefaultRegistrationChecker returns a RegistrationChecker that mirrors the
+// C++ etcd_keepalive::default_checker_t logic:
+//   - key absent (empty value)           → allow  (fresh registration)
+//   - key holds expectedValue            → allow  (same-identity restart)
+//   - key holds any other value          → reject (conflict)
+func DefaultRegistrationChecker(expectedValue string) RegistrationChecker {
+	return orchestrator.DefaultChecker(expectedValue)
+}
+
+// NewDiscoveryRegistrationChecker builds a DefaultRegistrationChecker whose
+// expected value is the JSON encoding of info — exactly the bytes the
+// RegistrationActor will PUT to etcd.  This gives "don't overwrite another
+// instance, but allow same-identity restart" semantics automatically at the
+// adapter layer without callers needing to know the encoding format.
+//
+// Returns nil (no check) when info is nil or encoding fails.
+func NewDiscoveryRegistrationChecker(info *pb.AtappDiscovery) RegistrationChecker {
+	if info == nil {
+		return nil
+	}
+	data, err := codec.MarshalDiscoveryToJSON(info)
+	if err != nil {
+		return nil
+	}
+	return DefaultRegistrationChecker(string(data))
+}
+
+// NewTopologyRegistrationChecker builds a DefaultRegistrationChecker whose
+// expected value is the JSON encoding of info — exactly the bytes the
+// RegistrationActor will PUT for topology keys.  Gives "don't overwrite another
+// instance, allow same-identity restart" semantics for topology keys.
+//
+// Returns nil (no check) when info is nil or encoding fails.
+func NewTopologyRegistrationChecker(info *pb.AtappTopologyInfo) RegistrationChecker {
+	if info == nil {
+		return nil
+	}
+	data, err := codec.MarshalTopologyToJSON(info)
+	if err != nil {
+		return nil
+	}
+	return DefaultRegistrationChecker(string(data))
+}
+
 // ServiceInfo groups the parameters required to register a single service.
 type ServiceInfo struct {
 	// Discovery is the AtappDiscovery proto to write.
@@ -127,6 +190,13 @@ type ServiceInfo struct {
 	Path string
 	// TTL overrides PathConfig.LeaseTTL for this service (0 = use default).
 	TTL int64
+	// Checker is an optional ownership predicate evaluated once before the
+	// first etcd.Put of the Discovery key within each lease epoch.  nil → no check.
+	// Use DefaultRegistrationChecker or NewDiscoveryRegistrationChecker.
+	Checker RegistrationChecker
+	// TopologyChecker is the same predicate for the topology key.
+	// nil → no check.  Use NewTopologyRegistrationChecker for standard semantics.
+	TopologyChecker RegistrationChecker
 }
 
 // ── Event handle ──────────────────────────────────────────────────────────

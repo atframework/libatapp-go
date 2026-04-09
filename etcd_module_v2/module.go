@@ -245,23 +245,34 @@ func (m *EtcdModule) RegisterService(ctx context.Context, svc ServiceInfo) (*Reg
 		ttl = m.cfg.LeaseTTL
 	}
 
-	var discoveryDone <-chan error
-	var topologyDone <-chan error
+	// Auto-inject default checkers when the caller did not supply one.
+	// This gives "don't overwrite another instance, allow same-identity restart"
+	// semantics by default for every registration going through this facade.
+	if svc.Discovery != nil && svc.Checker == nil {
+		svc.Checker = NewDiscoveryRegistrationChecker(svc.Discovery)
+	}
 
 	// Registration order: Topology MUST be written before Discovery.
 	// Remote peers identify upstream connectivity via the Topology record;
 	// writing Discovery first would make the node visible before its topology
 	// context is established, causing transient routing failures.
+	var discoveryDone <-chan error
+	var topologyDone <-chan error
+
 	topologyInfo := svc.TopologyInfo
 	if topologyInfo == nil {
 		topologyInfo = deriveTopologyInfoFromDiscovery(svc.Discovery)
 	}
 	if topologyInfo != nil {
-		topologyDone = m.regActor.AddTopology(ctx, topologyInfo, svc.Path, ttl)
+		topologyChecker := svc.TopologyChecker
+		if topologyChecker == nil {
+			topologyChecker = NewTopologyRegistrationChecker(topologyInfo)
+		}
+		topologyDone = m.regActor.AddTopology(ctx, topologyInfo, svc.Path, ttl, topologyChecker)
 	}
 
 	if svc.Discovery != nil {
-		discoveryDone = m.regActor.AddDiscovery(ctx, svc.Discovery, svc.Path, ttl)
+		discoveryDone = m.regActor.AddDiscovery(ctx, svc.Discovery, svc.Path, ttl, svc.Checker)
 	}
 
 	doneCh := make(chan error, 1)

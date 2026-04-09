@@ -25,6 +25,7 @@ package integration_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -379,4 +380,74 @@ func TestModule_Embed_Watch_InitialTopologySnapshot_WithNodes(t *testing.T) {
 	require.NotNil(t, snap)
 	assert.NotNil(t, snap.Topology.NodesByID[1001], "topology 快照必须包含节点 1001")
 	assert.NotNil(t, snap.Topology.NodesByID[1002], "topology 快照必须包含节点 1002")
+}
+ // TestModule_Watch_RevisionContinuity corresponds to C++ I.3.6
+// (watcher_revision_continuity).
+//
+// It verifies that ModRevision values carried in consecutive WatchNodePayload
+// events are monotonically non-decreasing.  In C++ the test writes N keys via
+// direct HTTP PUT and records the mod_revision from each watcher callback.
+// In Go, keys are written via a separate external etcd client; the Watch stream
+// delivers WatchNodePayload.ModRevision which mirrors the etcd KV's ModRevision.
+//
+// Sequential PUTs to different keys each consume a new etcd revision; the
+// resulting ModRevision sequence is strictly increasing.  The assertion uses
+// >= (non-decreasing) to stay consistent with the C++ CASE_EXPECT_GE and to
+// remain resilient to future batching optimisations.
+func TestModule_Watch_RevisionContinuity(t *testing.T) {
+	// Arrange
+	etcdAddr := embedEtcdEndpoint(t)
+	m := startEmbedModule(t, etcdAddr, []string{embedByIDPrefix})
+	ch := subscribeEmbedEvents(t, m)
+	extCli := newEmbedClient(t, etcdAddr)
+
+	// Wait for the initial (empty) snapshot so the Watch stream is established
+	// at a known revision before we start writing.
+	waitForEmbedEvent(t, ch, modulev2.EventWatchSnapshotLoaded, 15*time.Second)
+
+	const numKeys = 5
+	disc := [numKeys]*pb.AtappDiscovery{
+		{Id: 3601, Name: "rev-svc-3601"},
+		{Id: 3602, Name: "rev-svc-3602"},
+		{Id: 3603, Name: "rev-svc-3603"},
+		{Id: 3604, Name: "rev-svc-3604"},
+		{Id: 3605, Name: "rev-svc-3605"},
+	}
+
+	// Act: write all keys sequentially via the external raw client.
+	// Each Put gets its own etcd revision, so ModRevision values will be
+	// strictly increasing.
+	putCtx, putCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer putCancel()
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("%s/%s-%d", embedByIDPrefix, disc[i].Name, disc[i].Id)
+		_, err := extCli.Put(putCtx, key, marshalDiscoveryJSON(t, disc[i]))
+		require.NoError(t, err, "failed to PUT key %d", i)
+	}
+
+	// Collect numKeys EventWatchNodeUp events and extract their ModRevision.
+	var revisions []int64
+	deadline := time.After(15 * time.Second)
+	for len(revisions) < numKeys {
+		select {
+		case env := <-ch:
+			if env.Type != modulev2.EventWatchNodeUp {
+				continue
+			}
+			pl, ok := env.Payload.(modulev2.WatchNodePayload)
+			require.True(t, ok, "NodeUp payload must be WatchNodePayload")
+			revisions = append(revisions, pl.ModRevision)
+		case <-deadline:
+			t.Fatalf("timed out collecting EventWatchNodeUp events: got %d of %d",
+				len(revisions), numKeys)
+		}
+	}
+
+	// Assert: revisions must be monotonically non-decreasing.
+	require.Len(t, revisions, numKeys)
+	for i := 1; i < len(revisions); i++ {
+		assert.GreaterOrEqual(t, revisions[i], revisions[i-1],
+			"ModRevision[%d]=%d must be >= ModRevision[%d]=%d",
+			i, revisions[i], i-1, revisions[i-1])
+	}
 }
