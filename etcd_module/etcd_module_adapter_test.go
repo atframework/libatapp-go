@@ -14,6 +14,8 @@ import (
 	log "github.com/atframework/atframe-utils-go/log"
 	modulev2 "github.com/atframework/libatapp-go/etcd_module_v2"
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
+
+	libatapp_types "github.com/atframework/libatapp-go/types"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -175,7 +177,7 @@ func TestEtcdModuleAdapter_Reload_Disabled_Silent(t *testing.T) {
 // adapter 正确完成 disabled→enabled 状态迁移，全程只经过 Init/Reload 两个生命周期入口。
 func TestEtcdModuleAdapter_Reload_EnabledFromSilent_ReplaysRegistrations(t *testing.T) {
 	// Arrange: owner 初始配置 enable=false
-	owner := &stubOwner{cfg: AppConfig{ConfigPb: &pb.AtappConfigure{
+	owner := &stubOwner{cfg: libatapp_types.AppConfig{ConfigPb: &pb.AtappConfigure{
 		Etcd: &pb.AtappEtcd{Enable: false, Path: "/app/etcd"},
 	}}}
 	a := newEtcdModuleAdapter(owner)
@@ -203,7 +205,7 @@ func TestEtcdModuleAdapter_Reload_UpdatedRegistration_NewDataTakesEffect(t *test
 	// Arrange: owner 初始配置含 V1 应用名称（atapp_configure.name 映射到 atapp_discovery.name）
 	owner := &stubOwner{
 		id: 1,
-		cfg: AppConfig{ConfigPb: &pb.AtappConfigure{
+		cfg: libatapp_types.AppConfig{ConfigPb: &pb.AtappConfigure{
 			Name: "node-v1",
 			Etcd: &pb.AtappEtcd{Enable: true, Path: "/app/etcd"},
 		}},
@@ -718,53 +720,56 @@ func TestEtcdModuleAdapter_GetTopologyInfoSet_ReturnsEmptyMap_NoImpl(t *testing.
 // Only GetConfig() is meaningful; all other methods are no-op stubs.
 // Set the id field to a non-zero value when tests need GetId() != 0.
 type stubOwner struct {
-	cfg AppConfig
+	cfg libatapp_types.AppConfig
 	id  uint64
 }
 
-func (s *stubOwner) GetConfig() *AppConfig                               { return &s.cfg }
-func (s *stubOwner) Run(_ []string) error                                { return nil }
-func (s *stubOwner) Init(_ []string) error                               { return nil }
-func (s *stubOwner) RunOnce(_ *time.Ticker) error                        { return nil }
-func (s *stubOwner) Stop() error                                         { return nil }
-func (s *stubOwner) Reload() error                                       { return nil }
-func (s *stubOwner) GetId() uint64                                       { return s.id }
-func (s *stubOwner) GetTypeId() uint64                                   { return 0 }
-func (s *stubOwner) GetTypeName() string                                 { return "" }
-func (s *stubOwner) GetAppName() string                                  { return "" }
-func (s *stubOwner) GetAppIdentity() string                              { return "" }
-func (s *stubOwner) GetHashCode() string                                 { return "" }
-func (s *stubOwner) GetAppVersion() string                               { return "" }
-func (s *stubOwner) GetBuildVersion() string                             { return "" }
-func (s *stubOwner) GetConfigFile() string                               { return "" }
-func (s *stubOwner) GetSysNow() time.Time                                { return time.Time{} }
-func (s *stubOwner) AddModule(_ lu.TypeID, _ AppModuleImpl) error        { return nil }
-func (s *stubOwner) GetModule(_ lu.TypeID) AppModuleImpl                 { return nil }
-func (s *stubOwner) SendMessage(_ uint64, _ int32, _ []byte) error       { return nil }
-func (s *stubOwner) SendMessageByName(_ string, _ int32, _ []byte) error { return nil }
-func (s *stubOwner) SetEventHandler(_ string, _ EventHandler)            {}
-func (s *stubOwner) TriggerEvent(_ string, _ *AppActionSender) int       { return 0 }
-func (s *stubOwner) PushAction(_ func(*AppActionData) error, _ []byte, _ interface{}) error {
+func (s *stubOwner) GetConfig() *libatapp_types.AppConfig                         { return &s.cfg }
+func (s *stubOwner) Run(_ []string) error                                         { return nil }
+func (s *stubOwner) Init(_ []string) error                                        { return nil }
+func (s *stubOwner) RunOnce(_ *time.Ticker) error                                 { return nil }
+func (s *stubOwner) Stop() error                                                  { return nil }
+func (s *stubOwner) Reload() error                                                { return nil }
+func (s *stubOwner) GetId() uint64                                                { return s.id }
+func (s *stubOwner) GetTypeId() uint64                                            { return 0 }
+func (s *stubOwner) GetTypeName() string                                          { return "" }
+func (s *stubOwner) GetAppName() string                                           { return "" }
+func (s *stubOwner) GetAppIdentity() string                                       { return "" }
+func (s *stubOwner) GetHashCode() string                                          { return "" }
+func (s *stubOwner) GetAppVersion() string                                        { return "" }
+func (s *stubOwner) GetBuildVersion() string                                      { return "" }
+func (s *stubOwner) GetConfigFile() string                                        { return "" }
+func (s *stubOwner) GetSysNow() time.Time                                         { return time.Time{} }
+func (s *stubOwner) AddModule(_ lu.TypeID, _ libatapp_types.AppModuleImpl) error  { return nil }
+func (s *stubOwner) GetModule(_ lu.TypeID) libatapp_types.AppModuleImpl           { return nil }
+func (s *stubOwner) SendMessage(_ uint64, _ int32, _ []byte) error                { return nil }
+func (s *stubOwner) SendMessageByName(_ string, _ int32, _ []byte) error          { return nil }
+func (s *stubOwner) SetEventHandler(_ string, _ libatapp_types.EventHandler)      {}
+func (s *stubOwner) TriggerEvent(_ string, _ *libatapp_types.AppActionSender) int { return 0 }
+func (s *stubOwner) PushAction(_ func(*libatapp_types.AppActionData) error, _ []byte, _ interface{}) error {
 	return nil
 }
-func (s *stubOwner) LoadConfig(_ string, _ string, _ string, _ *ConfigExistedIndex) error {
+
+func (s *stubOwner) LoadConfig(_ string, _ string, _ string, _ *libatapp_types.ConfigExistedIndex) error {
 	return nil
 }
-func (s *stubOwner) LoadConfigByPath(_ proto.Message, _ string, _ string, _ *ConfigExistedIndex, _ string) error {
+
+func (s *stubOwner) LoadConfigByPath(_ proto.Message, _ string, _ string, _ *libatapp_types.ConfigExistedIndex, _ string) error {
 	return nil
 }
-func (s *stubOwner) LoadLogConfigByPath(_ *pb.AtappLog, _ string, _ string, _ *ConfigExistedIndex, _ string) error {
+
+func (s *stubOwner) LoadLogConfigByPath(_ *pb.AtappLog, _ string, _ string, _ *libatapp_types.ConfigExistedIndex, _ string) error {
 	return nil
 }
-func (s *stubOwner) IsInited() bool                 { return false }
-func (s *stubOwner) IsRunning() bool                { return false }
-func (s *stubOwner) IsClosing() bool                { return false }
-func (s *stubOwner) IsClosed() bool                 { return false }
-func (s *stubOwner) CheckFlag(_ AppFlag) bool       { return false }
-func (s *stubOwner) SetFlag(_ AppFlag, _ bool) bool { return false }
-func (s *stubOwner) GetAppContext() context.Context { return context.Background() }
-func (s *stubOwner) GetDefaultLogger() *log.Logger  { return nil }
-func (s *stubOwner) GetLogger(_ int) *log.Logger    { return nil }
+func (s *stubOwner) IsInited() bool                                { return false }
+func (s *stubOwner) IsRunning() bool                               { return false }
+func (s *stubOwner) IsClosing() bool                               { return false }
+func (s *stubOwner) IsClosed() bool                                { return false }
+func (s *stubOwner) CheckFlag(_ libatapp_types.AppFlag) bool       { return false }
+func (s *stubOwner) SetFlag(_ libatapp_types.AppFlag, _ bool) bool { return false }
+func (s *stubOwner) GetAppContext() context.Context                { return context.Background() }
+func (s *stubOwner) GetDefaultLogger() *log.Logger                 { return nil }
+func (s *stubOwner) GetLogger(_ int) *log.Logger                   { return nil }
 
 // adapterMockClient is a minimal EtcdClient implementation for adapter tests
 // that require a running EtcdModule.  All operations return immediate success.
