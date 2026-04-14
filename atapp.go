@@ -1135,6 +1135,14 @@ func (app *AppInstance) setupStartupLog() error {
 			return err
 		}
 
+		if _, err := os.Stat(app.config.CrashOutputFile); err != nil {
+			backupFile := fmt.Sprintf("%s.bak", app.config.CrashOutputFile)
+			if _, err := os.Stat(backupFile); err == nil {
+				os.Remove(backupFile)
+			}
+			os.Rename(app.config.CrashOutputFile, backupFile)
+		}
+
 		f, err := os.OpenFile(app.config.CrashOutputFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
 		if err != nil {
 			app.GetDefaultLogger().LogError("Create crash output file failed", "file", app.config.CrashOutputFile, "error", err)
