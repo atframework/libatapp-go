@@ -1,4 +1,4 @@
-package libatapp
+package libatapp_types
 
 import (
 	"context"

@@ -1,4 +1,4 @@
-package libatapp
+package libatapp_etcd_module
 
 import (
 	"context"
@@ -773,23 +773,29 @@ type adapterMockClient struct{}
 func (*adapterMockClient) Grant(_ context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
 	return &clientv3.LeaseGrantResponse{ID: 1001, TTL: ttl}, nil
 }
+
 func (*adapterMockClient) KeepAlive(ctx context.Context, _ clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error) {
 	ch := make(chan *clientv3.LeaseKeepAliveResponse)
 	go func() { <-ctx.Done(); close(ch) }()
 	return ch, nil
 }
+
 func (*adapterMockClient) Revoke(_ context.Context, _ clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
 	return &clientv3.LeaseRevokeResponse{}, nil
 }
+
 func (*adapterMockClient) Get(_ context.Context, _ string, _ ...clientv3.OpOption) (*clientv3.GetResponse, error) {
 	return &clientv3.GetResponse{}, nil
 }
+
 func (*adapterMockClient) Put(_ context.Context, _, _ string, _ ...clientv3.OpOption) (*clientv3.PutResponse, error) {
 	return &clientv3.PutResponse{}, nil
 }
+
 func (*adapterMockClient) Delete(_ context.Context, _ string, _ ...clientv3.OpOption) (*clientv3.DeleteResponse, error) {
 	return &clientv3.DeleteResponse{}, nil
 }
+
 func (*adapterMockClient) Watch(ctx context.Context, _ string, _ ...clientv3.OpOption) clientv3.WatchChan {
 	ch := make(chan clientv3.WatchResponse)
 	go func() { <-ctx.Done(); close(ch) }()

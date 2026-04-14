@@ -25,145 +25,54 @@ import (
 
 	atframe_protocol "github.com/atframework/libatapp-go/protocol/atframe"
 	"github.com/panjf2000/ants/v2"
+
+	libatapp_types "github.com/atframework/libatapp-go/types"
 )
 
-// App 应用模式
-type AppMode int
-
-const (
-	AppModeCustom AppMode = iota
-	AppModeStart
-	AppModeStop
-	AppModeReload
-	AppModeInfo
-	AppModeHelp
+type (
+	AppMode         = libatapp_types.AppMode
+	AppFlag         = libatapp_types.AppFlag
+	AppConfig       = libatapp_types.AppConfig
+	Message         = libatapp_types.Message
+	EventHandler    = libatapp_types.EventHandler
+	AppImpl         = libatapp_types.AppImpl
+	AppModuleImpl   = libatapp_types.AppModuleImpl
+	AppLog          = libatapp_types.AppLog
+	AppActionSender = libatapp_types.AppActionSender
+	AppActionData   = libatapp_types.AppActionData
+	AppModuleBase   = libatapp_types.AppModuleBase
 )
 
-// App 状态标志
-type AppFlag uint64
-
-const (
-	AppFlagInitializing AppFlag = 1 << iota
-	AppFlagInitialized
-	AppFlagRunning
-	AppFlagStopping
-	AppFlagStopped
-	AppFlagTimeout
-	AppFlagInCallback
-	AppFlagInTick
-	AppFlagDestroying
-)
-
-// App 配置
-type AppConfig struct {
-	// Runtime配置
-	HashCode     string
-	AppName      string
-	BuildVersion string
-	AppVersion   string
-	ConfigFile   string
-	PidFile      string
-	ExecutePath  string
-	IdCmd        string // from -id command line argument
-
-	// 日志配置
-	StartupLog       []string
-	StartupErrorFile string
-	CrashOutputFile  string
-
-	// 文件配置
-	ConfigPb         *atframe_protocol.AtappConfigure
-	ConfigLog        *atframe_protocol.AtappLog
-	ConfigOriginData interface{}
-}
-
-// 消息类型
-type Message struct {
-	Type       int32
-	Sequence   uint64
-	Data       []byte
-	Metadata   map[string]string
-	SourceId   uint64
-	SourceName string
-}
-
-// 事件处理函数类型
-type EventHandler func(*AppInstance, *AppActionSender) int
-
-// App 应用接口
-type AppImpl interface {
-	Run(arguments []string) error
-
-	Init(arguments []string) error
-	RunOnce(tickTimer *time.Ticker) error
-	Stop() error
-	Reload() error
-
-	GetId() uint64
-	GetTypeId() uint64
-	GetTypeName() string
-	GetAppName() string
-	GetAppIdentity() string
-	GetHashCode() string
-	GetAppVersion() string
-	GetBuildVersion() string
-	GetConfigFile() string
-
-	GetSysNow() time.Time
-
-	AddModule(typeInst lu.TypeID, module AppModuleImpl) error
-
-	GetModule(typeInst lu.TypeID) AppModuleImpl
-
-	// 消息相关
-	SendMessage(targetId uint64, msgType int32, data []byte) error
-	SendMessageByName(targetName string, msgType int32, data []byte) error
-
-	// 事件相关
-	SetEventHandler(eventType string, handler EventHandler)
-	TriggerEvent(eventType string, args *AppActionSender) int
-
-	// 自定义Action
-	PushAction(callback func(action *AppActionData) error, message_data []byte, private_data interface{}) error
-
-	// 配置相关
-	GetConfig() *AppConfig
-	LoadConfig(configFile string, configurePrefixPath string, loadEnvironemntPrefix string, existedKeys *ConfigExistedIndex) error
-	LoadConfigByPath(target proto.Message,
-		configurePrefixPath string, loadEnvironemntPrefix string,
-		existedKeys *ConfigExistedIndex, existedSetPrefix string,
-	) error
-	LoadLogConfigByPath(target *atframe_protocol.AtappLog,
-		configurePrefixPath string, loadEnvironemntPrefix string,
-		existedKeys *ConfigExistedIndex, existedSetPrefix string,
-	) error
-
-	// 状态相关
-	IsInited() bool
-	IsRunning() bool
-	IsClosing() bool
-	IsClosed() bool
-	CheckFlag(flag AppFlag) bool
-	SetFlag(flag AppFlag, value bool) bool
-
-	// 生命周期管理
-	GetAppContext() context.Context
-
-	// Logger
-	GetDefaultLogger() *log.Logger
-	GetLogger(index int) *log.Logger
-}
-
-type AppLog struct {
+type AppLogInstance struct {
 	loggers []*log.Logger
 	writers []log.LogWriter
+}
+
+func (appLog *AppLogInstance) GetLoggers() []*log.Logger {
+	if appLog == nil {
+		return nil
+	}
+
+	return appLog.loggers
+}
+
+func (appLog *AppLogInstance) GetWriters() []log.LogWriter {
+	if appLog == nil {
+		return nil
+	}
+
+	return appLog.writers
+}
+
+func CreateAppModuleBase(owner AppImpl) AppModuleBase {
+	return libatapp_types.CreateAppModuleBase(owner)
 }
 
 type AppInstance struct {
 	// 基础配置
 	config AppConfig
 	flags  uint64 // 原子操作的状态标志
-	mode   AppMode
+	mode   libatapp_types.AppMode
 
 	// 命令行参数处理
 	flagSet        *flag.FlagSet
@@ -194,7 +103,7 @@ type AppInstance struct {
 	logFrameInfoCache sync.Map
 
 	// 日志
-	logger *AppLog
+	logger *AppLogInstance
 
 	// 协程池
 	workerPool *ants.PoolWithFunc
@@ -215,13 +124,13 @@ type AppInstance struct {
 
 func CreateAppInstance() AppImpl {
 	ret := &AppInstance{
-		mode:          AppModeHelp,
+		mode:          libatapp_types.AppModeHelp,
 		moduleMap:     make(map[lu.TypeID]AppModuleImpl),
 		stopTimepoint: time.Time{},
 		stopTimeout:   time.Time{},
 		eventHandlers: make(map[string]EventHandler),
 		signalChan:    make(chan os.Signal, 1),
-		logger: &AppLog{
+		logger: &AppLogInstance{
 			loggers: make([]*log.Logger, 0),
 		},
 	}
@@ -284,7 +193,7 @@ func (app *AppInstance) generateHashCode() {
 }
 
 // 状态管理方法
-func checkFlag(flags uint64, checked AppFlag) bool {
+func checkFlag(flags uint64, checked libatapp_types.AppFlag) bool {
 	return flags&uint64(checked) != 0
 }
 
@@ -292,11 +201,11 @@ func (app *AppInstance) getFlags() uint64 {
 	return atomic.LoadUint64(&app.flags)
 }
 
-func (app *AppInstance) CheckFlag(flag AppFlag) bool {
+func (app *AppInstance) CheckFlag(flag libatapp_types.AppFlag) bool {
 	return checkFlag(app.getFlags(), flag)
 }
 
-func (app *AppInstance) SetFlag(flag AppFlag, value bool) bool {
+func (app *AppInstance) SetFlag(flag libatapp_types.AppFlag, value bool) bool {
 	for {
 		old := atomic.LoadUint64(&app.flags)
 		var new uint64
@@ -311,13 +220,13 @@ func (app *AppInstance) SetFlag(flag AppFlag, value bool) bool {
 	}
 }
 
-func (app *AppInstance) InitLog(config *atframe_protocol.AtappLog) (*AppLog, error) {
+func (app *AppInstance) InitLog(config *atframe_protocol.AtappLog) (*AppLogInstance, error) {
 	if config == nil {
 		return nil, fmt.Errorf("log config is nil")
 	}
 
 	globalLevel := log.ConvertLogLevel(config.Level)
-	appLog := new(AppLog)
+	appLog := new(AppLogInstance)
 
 	for i := range config.Category {
 		index := config.Category[i].Index
@@ -379,10 +288,10 @@ func (app *AppInstance) InitLog(config *atframe_protocol.AtappLog) (*AppLog, err
 	return appLog, nil
 }
 
-func (app *AppInstance) IsInited() bool  { return app.CheckFlag(AppFlagInitialized) }
-func (app *AppInstance) IsRunning() bool { return app.CheckFlag(AppFlagRunning) }
-func (app *AppInstance) IsClosing() bool { return app.CheckFlag(AppFlagStopping) }
-func (app *AppInstance) IsClosed() bool  { return app.CheckFlag(AppFlagStopped) }
+func (app *AppInstance) IsInited() bool  { return app.CheckFlag(libatapp_types.AppFlagInitialized) }
+func (app *AppInstance) IsRunning() bool { return app.CheckFlag(libatapp_types.AppFlagRunning) }
+func (app *AppInstance) IsClosing() bool { return app.CheckFlag(libatapp_types.AppFlagStopping) }
+func (app *AppInstance) IsClosed() bool  { return app.CheckFlag(libatapp_types.AppFlagStopped) }
 
 func (app *AppInstance) AddModule(typeInst lu.TypeID, module AppModuleImpl) error {
 	if lu.IsNil(module) {
@@ -390,7 +299,7 @@ func (app *AppInstance) AddModule(typeInst lu.TypeID, module AppModuleImpl) erro
 	}
 
 	flags := app.getFlags()
-	if checkFlag(flags, AppFlagInitialized) || checkFlag(flags, AppFlagInitializing) {
+	if checkFlag(flags, libatapp_types.AppFlagInitialized) || checkFlag(flags, libatapp_types.AppFlagInitializing) {
 		return fmt.Errorf("cannot add module when app is initializing or initialized")
 	}
 
@@ -440,12 +349,12 @@ func (app *AppInstance) Init(arguments []string) error {
 		return nil
 	}
 
-	if app.CheckFlag(AppFlagInitializing) {
+	if app.CheckFlag(libatapp_types.AppFlagInitializing) {
 		return fmt.Errorf("recursive initialization detected")
 	}
 
-	app.SetFlag(AppFlagInitializing, true)
-	defer app.SetFlag(AppFlagInitializing, false)
+	app.SetFlag(libatapp_types.AppFlagInitializing, true)
+	defer app.SetFlag(libatapp_types.AppFlagInitializing, false)
 
 	// 解析命令行参数
 	if err := app.setupOptions(arguments); err != nil {
@@ -453,18 +362,18 @@ func (app *AppInstance) Init(arguments []string) error {
 	}
 	app.setupCommandManager()
 
-	if app.mode == AppModeInfo {
+	if app.mode == libatapp_types.AppModeInfo {
 		return nil
 	}
 
-	if app.mode == AppModeHelp {
+	if app.mode == libatapp_types.AppModeHelp {
 		app.flagSet.PrintDefaults()
 		return nil
 	}
 
 	// 初始化启动流程日志
 	if err := app.setupStartupLog(); err != nil {
-		if app.mode == AppModeStart {
+		if app.mode == libatapp_types.AppModeStart {
 			app.writeStartupErrorFile(err)
 		}
 		return fmt.Errorf("setup startup log failed: %w", err)
@@ -473,9 +382,9 @@ func (app *AppInstance) Init(arguments []string) error {
 	app.GetDefaultLogger().LogWarn("======================== App Initializing(startup log) ========================")
 
 	// 设置信号处理
-	if app.mode != AppModeCustom && app.mode != AppModeStop && app.mode != AppModeReload {
+	if app.mode != libatapp_types.AppModeCustom && app.mode != libatapp_types.AppModeStop && app.mode != libatapp_types.AppModeReload {
 		if err := app.setupSignal(); err != nil {
-			if app.mode == AppModeStart {
+			if app.mode == libatapp_types.AppModeStart {
 				app.writeStartupErrorFile(err)
 			}
 			return fmt.Errorf("setup signal failed: %w", err)
@@ -484,7 +393,7 @@ func (app *AppInstance) Init(arguments []string) error {
 
 	// 加载配置
 	if err := app.LoadConfig(app.config.ConfigFile, "atapp", "ATAPP", nil); err != nil {
-		if app.mode == AppModeStart {
+		if app.mode == libatapp_types.AppModeStart {
 			app.writeStartupErrorFile(err)
 		}
 		return fmt.Errorf("load config failed: %w", err)
@@ -497,13 +406,13 @@ func (app *AppInstance) Init(arguments []string) error {
 	// 生成哈希码
 	app.generateHashCode()
 
-	if app.mode == AppModeCustom || app.mode == AppModeStop || app.mode == AppModeReload {
+	if app.mode == libatapp_types.AppModeCustom || app.mode == libatapp_types.AppModeStop || app.mode == libatapp_types.AppModeReload {
 		return app.sendLastCommand()
 	}
 
 	// 初始化日志
 	if err := app.setupLog(); err != nil {
-		if app.mode == AppModeStart {
+		if app.mode == libatapp_types.AppModeStart {
 			app.writeStartupErrorFile(err)
 		}
 		return fmt.Errorf("setup log failed: %w", err)
@@ -513,7 +422,7 @@ func (app *AppInstance) Init(arguments []string) error {
 
 	// 设置定时器
 	if err := app.setupTickTimer(); err != nil {
-		if app.mode == AppModeStart {
+		if app.mode == libatapp_types.AppModeStart {
 			app.writeStartupErrorFile(err)
 		}
 		return fmt.Errorf("setup timer failed: %w", err)
@@ -536,7 +445,7 @@ func (app *AppInstance) Init(arguments []string) error {
 		}),
 	)
 	if err != nil {
-		if app.mode == AppModeStart {
+		if app.mode == libatapp_types.AppModeStart {
 			app.writeStartupErrorFile(err)
 		}
 		return err
@@ -552,7 +461,7 @@ func (app *AppInstance) Init(arguments []string) error {
 			break
 		}
 		if err := m.Setup(initContext); err != nil {
-			if app.mode == AppModeStart {
+			if app.mode == libatapp_types.AppModeStart {
 				app.writeStartupErrorFile(err)
 			}
 			return fmt.Errorf("module setup failed: %w", err)
@@ -567,7 +476,7 @@ func (app *AppInstance) Init(arguments []string) error {
 			break
 		}
 		if err := m.SetupLog(initContext); err != nil {
-			if app.mode == AppModeStart {
+			if app.mode == libatapp_types.AppModeStart {
 				app.writeStartupErrorFile(err)
 			}
 			return fmt.Errorf("module setup log failed: %w", err)
@@ -580,7 +489,7 @@ func (app *AppInstance) Init(arguments []string) error {
 			break
 		}
 		if err := m.Reload(); err != nil {
-			if app.mode == AppModeStart {
+			if app.mode == libatapp_types.AppModeStart {
 				app.writeStartupErrorFile(err)
 			}
 			return fmt.Errorf("module reload failed: %w", err)
@@ -593,7 +502,7 @@ func (app *AppInstance) Init(arguments []string) error {
 			break
 		}
 		if err := m.Init(initContext); err != nil {
-			if app.mode == AppModeStart {
+			if app.mode == libatapp_types.AppModeStart {
 				app.writeStartupErrorFile(err)
 			}
 			return fmt.Errorf("%s module init failed: %w", m.Name(), err)
@@ -610,12 +519,12 @@ func (app *AppInstance) Init(arguments []string) error {
 	if maybeErr == nil {
 		// TODO: evt_on_all_module_inited_(*this);
 
-		app.SetFlag(AppFlagRunning, true)
-		app.SetFlag(AppFlagInitialized, true)
-		app.SetFlag(AppFlagStopped, false)
-		app.SetFlag(AppFlagStopping, false)
+		app.SetFlag(libatapp_types.AppFlagRunning, true)
+		app.SetFlag(libatapp_types.AppFlagInitialized, true)
+		app.SetFlag(libatapp_types.AppFlagStopped, false)
+		app.SetFlag(libatapp_types.AppFlagStopping, false)
 
-		if app.mode == AppModeStart {
+		if app.mode == libatapp_types.AppModeStart {
 			app.writePidFile()
 			app.cleanupStartupErrorFile()
 		}
@@ -650,15 +559,15 @@ func (app *AppInstance) Init(arguments []string) error {
 }
 
 func (app *AppInstance) internalRunOnce(tickTimer *time.Ticker) error {
-	if !app.IsInited() && !app.CheckFlag(AppFlagInitializing) {
+	if !app.IsInited() && !app.CheckFlag(libatapp_types.AppFlagInitializing) {
 		return fmt.Errorf("app is not initialized")
 	}
 
-	if app.CheckFlag(AppFlagInCallback) {
+	if app.CheckFlag(libatapp_types.AppFlagInCallback) {
 		return nil
 	}
 
-	if app.mode != AppModeCustom && app.mode != AppModeStart {
+	if app.mode != libatapp_types.AppModeCustom && app.mode != libatapp_types.AppModeStart {
 		return nil
 	}
 
@@ -680,19 +589,19 @@ func (app *AppInstance) internalRunOnce(tickTimer *time.Ticker) error {
 	}
 
 	flags := app.getFlags()
-	if checkFlag(flags, AppFlagStopping) && !checkFlag(flags, AppFlagStopped) {
+	if checkFlag(flags, libatapp_types.AppFlagStopping) && !checkFlag(flags, libatapp_types.AppFlagStopped) {
 		now := app.GetSysNow()
 		if now.After(app.stopTimeout) {
-			app.SetFlag(AppFlagTimeout, true)
+			app.SetFlag(libatapp_types.AppFlagTimeout, true)
 		}
-		forceTimeout := checkFlag(flags, AppFlagTimeout)
+		forceTimeout := checkFlag(flags, libatapp_types.AppFlagTimeout)
 		if now.After(app.stopTimepoint) || forceTimeout {
 			app.stopTimepoint = now.Add(app.config.ConfigPb.GetTimer().GetStopInterval().AsDuration())
 			app.closeAllModules(forceTimeout)
 		}
 	}
 
-	if checkFlag(flags, AppFlagStopped) && !checkFlag(flags, AppFlagInitialized) {
+	if checkFlag(flags, libatapp_types.AppFlagStopped) && !checkFlag(flags, libatapp_types.AppFlagInitialized) {
 		app.cleanup()
 	}
 
@@ -747,7 +656,7 @@ func (app *AppInstance) closeAllModules(forceTimeout bool) (bool, error) {
 	}
 
 	if allClosed {
-		app.SetFlag(AppFlagStopped, true)
+		app.SetFlag(libatapp_types.AppFlagStopped, true)
 	}
 
 	return allClosed, err
@@ -796,8 +705,8 @@ func (app *AppInstance) cleanup() error {
 	// cleanup pidfile
 	app.cleanupPidFile()
 
-	app.SetFlag(AppFlagRunning, false)
-	app.SetFlag(AppFlagInitialized, false)
+	app.SetFlag(libatapp_types.AppFlagRunning, false)
+	app.SetFlag(libatapp_types.AppFlagInitialized, false)
 
 	// TODO: finally callback
 	return nil
@@ -828,7 +737,7 @@ func (app *AppInstance) Stop() error {
 	app.GetDefaultLogger().LogWarn("======================== App Stopping ========================")
 
 	app.stopTimeout = app.GetSysNow().Add(app.config.ConfigPb.GetTimer().GetStopInterval().AsDuration())
-	app.SetFlag(AppFlagStopping, true)
+	app.SetFlag(libatapp_types.AppFlagStopping, true)
 	app.stopAppHandle()
 	return nil
 }
@@ -923,7 +832,7 @@ func LoadConfigFromOriginDataByPath(logger *log.Logger,
 	}
 
 	if existedKeys == nil {
-		existedKeys = CreateConfigExistedIndex()
+		existedKeys = libatapp_types.CreateConfigExistedIndex()
 	}
 
 	if loadEnvironemntPrefix != "" {
@@ -1015,7 +924,7 @@ func (app *AppInstance) LoadConfig(configFile string, configurePrefixPath string
 	}
 
 	if existedKeys == nil {
-		existedKeys = CreateConfigExistedIndex()
+		existedKeys = libatapp_types.CreateConfigExistedIndex()
 	}
 
 	configPb := &atframe_protocol.AtappConfigure{}
@@ -1126,13 +1035,13 @@ func (app *AppInstance) setupOptions(arguments []string) error {
 	}
 
 	if app.flagSet.Lookup("version").Value.String() == "true" {
-		app.mode = AppModeInfo
+		app.mode = libatapp_types.AppModeInfo
 		println(app.GetBuildVersion())
 		return nil
 	}
 
 	if app.flagSet.Lookup("help").Value.String() == "true" {
-		app.mode = AppModeHelp
+		app.mode = libatapp_types.AppModeHelp
 		return nil
 	}
 
@@ -1157,20 +1066,20 @@ func (app *AppInstance) setupOptions(arguments []string) error {
 	if len(args) > 0 {
 		switch args[0] {
 		case "start":
-			app.mode = AppModeStart
+			app.mode = libatapp_types.AppModeStart
 		case "stop":
-			app.mode = AppModeStop
+			app.mode = libatapp_types.AppModeStop
 			app.lastCommand = []string{"stop"}
 		case "reload":
-			app.mode = AppModeReload
+			app.mode = libatapp_types.AppModeReload
 			app.lastCommand = []string{"reload"}
 		case "run":
-			app.mode = AppModeCustom
+			app.mode = libatapp_types.AppModeCustom
 			app.lastCommand = args[1:]
 		case "help":
-			app.mode = AppModeHelp
+			app.mode = libatapp_types.AppModeHelp
 		case "version":
-			app.mode = AppModeInfo
+			app.mode = libatapp_types.AppModeInfo
 		default:
 			return fmt.Errorf("unknown command: %s", args[0])
 		}
@@ -1273,12 +1182,12 @@ func (app *AppInstance) setupTickTimer() error {
 }
 
 func (app *AppInstance) tick() error {
-	if app.CheckFlag(AppFlagInTick) {
+	if app.CheckFlag(libatapp_types.AppFlagInTick) {
 		return nil
 	}
 
-	app.SetFlag(AppFlagInTick, true)
-	defer app.SetFlag(AppFlagInTick, false)
+	app.SetFlag(libatapp_types.AppFlagInTick, true)
+	defer app.SetFlag(libatapp_types.AppFlagInTick, false)
 
 	atomic.AddUint64(&app.stats.tickCount, 1)
 
@@ -1440,12 +1349,18 @@ func (app *AppInstance) handleReloadCommand(_args []string) error {
 	return nil
 }
 
+var globalAppActionSenderPool = sync.Pool{
+	New: func() interface{} {
+		return new(AppActionSender)
+	},
+}
+
 func (app *AppInstance) MakeAction(callback func(action *AppActionData) error, message_data []byte, private_data interface{}) *AppActionSender {
 	sender := globalAppActionSenderPool.Get().(*AppActionSender)
-	sender.callback = callback
-	sender.data.MessageData = message_data
-	sender.data.PrivateData = private_data
-	sender.data.App = app
+	sender.Callback = callback
+	sender.Data.MessageData = message_data
+	sender.Data.PrivateData = private_data
+	sender.Data.App = app
 	return sender
 }
 
@@ -1461,36 +1376,11 @@ func (app *AppInstance) PushAction(callback func(action *AppActionData) error, m
 }
 
 func (app *AppInstance) processAction(sender *AppActionSender) {
-	err := sender.callback(&sender.data)
+	err := sender.Callback(&sender.Data)
 	if err != nil {
 		app.GetDefaultLogger().LogError("Action callback error", slog.Any("err", err))
 	}
 
-	sender.reset()
+	sender.Reset()
 	globalAppActionSenderPool.Put(sender)
-}
-
-// AppAction对象
-type AppActionData struct {
-	App         AppImpl
-	MessageData []byte
-	PrivateData interface{}
-}
-
-type AppActionSender struct {
-	callback func(action *AppActionData) error
-	data     AppActionData
-}
-
-func (s *AppActionSender) reset() {
-	s.callback = nil
-	s.data.App = nil
-	s.data.MessageData = nil
-	s.data.PrivateData = nil
-}
-
-var globalAppActionSenderPool = sync.Pool{
-	New: func() interface{} {
-		return new(AppActionSender)
-	},
 }

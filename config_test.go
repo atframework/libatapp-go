@@ -11,6 +11,8 @@ import (
 
 	atframe_protocol "github.com/atframework/libatapp-go/protocol/atframe"
 	"github.com/stretchr/testify/assert"
+
+	libatapp_types "github.com/atframework/libatapp-go/types"
 )
 
 // 示例模块实现
@@ -452,7 +454,7 @@ func TestConfigManagementFromYaml(t *testing.T) {
 	config := app.GetConfig()
 
 	// 测试配置加载
-	existedAppKeys := CreateConfigExistedIndex()
+	existedAppKeys := libatapp_types.CreateConfigExistedIndex()
 	if err := app.LoadConfig("atapp_configure_loader_test.yaml", "atapp", "ATAPP", existedAppKeys); err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
@@ -480,8 +482,8 @@ func TestConfigManagementFromYaml(t *testing.T) {
 	})
 
 	// 验证key存在索引
-	existedEtcdKeys := CreateConfigExistedIndex()
-	existedLogKeys := CreateConfigExistedIndex()
+	existedEtcdKeys := libatapp_types.CreateConfigExistedIndex()
+	existedLogKeys := libatapp_types.CreateConfigExistedIndex()
 	etcdCfg := &atframe_protocol.AtappEtcd{}
 	logsCfg := &atframe_protocol.AtappLog{}
 	app.LoadConfigByPath(etcdCfg, "atapp.etcd", "ATAPP_ETCD", existedEtcdKeys, "")
@@ -562,7 +564,7 @@ func runConfigVerificationForEnv(t *testing.T, cfg *atframe_protocol.AtappConfig
 // TestConfigManagementFromEnvironment 测试从环境变量加载配置
 func TestConfigManagementFromEnvironment(t *testing.T) {
 	// 加载环境变量文件
-	existedAppKeys := CreateConfigExistedIndex()
+	existedAppKeys := libatapp_types.CreateConfigExistedIndex()
 	envKeys, err := loadEnvFile("atapp_configure_loader_test.env.txt")
 	if err != nil {
 		t.Fatalf("Failed to load env file: %v", err)
@@ -596,8 +598,8 @@ func TestConfigManagementFromEnvironment(t *testing.T) {
 	})
 
 	// 验证key存在索引
-	existedEtcdKeys := CreateConfigExistedIndex()
-	existedLogKeys := CreateConfigExistedIndex()
+	existedEtcdKeys := libatapp_types.CreateConfigExistedIndex()
+	existedLogKeys := libatapp_types.CreateConfigExistedIndex()
 	etcdCfg := &atframe_protocol.AtappEtcd{}
 	logsCfg := &atframe_protocol.AtappLog{}
 	app.LoadConfigByPath(etcdCfg, "atapp.etcd", "ATAPP_ETCD", existedEtcdKeys, "")
@@ -971,7 +973,7 @@ func TestExpandExpressionInConfigYaml(t *testing.T) {
 	app := CreateAppInstance().(*AppInstance)
 
 	// Act: load config from expression test yaml
-	existedAppKeys := CreateConfigExistedIndex()
+	existedAppKeys := libatapp_types.CreateConfigExistedIndex()
 	if err := app.LoadConfig("atapp_configure_expression_test.yaml", "atapp", "ATAPP", existedAppKeys); err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
@@ -1006,7 +1008,7 @@ func TestExpandExpressionInConfigEnv(t *testing.T) {
 	app := CreateAppInstance().(*AppInstance)
 
 	// Act: load config from environment only (no config file)
-	existedAppKeys := CreateConfigExistedIndex()
+	existedAppKeys := libatapp_types.CreateConfigExistedIndex()
 	if err := app.LoadConfig("", "atapp", "ATAPP", existedAppKeys); err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
@@ -1029,8 +1031,8 @@ func TestExpandExpressionInConfigEnv(t *testing.T) {
 	})
 
 	// Verify separate path loading (shared with loader env test)
-	existedEtcdKeys := CreateConfigExistedIndex()
-	existedLogKeys := CreateConfigExistedIndex()
+	existedEtcdKeys := libatapp_types.CreateConfigExistedIndex()
+	existedLogKeys := libatapp_types.CreateConfigExistedIndex()
 	etcdCfg := &atframe_protocol.AtappEtcd{}
 	logsCfg := &atframe_protocol.AtappLog{}
 	app.LoadConfigByPath(etcdCfg, "atapp.etcd", "ATAPP_ETCD", existedEtcdKeys, "")

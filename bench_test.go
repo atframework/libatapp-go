@@ -33,7 +33,7 @@ func BenchmarkTick(b *testing.B) {
 
 func BenchmarkEventTrigger(b *testing.B) {
 	app := CreateAppInstance().(*AppInstance)
-	app.SetEventHandler("test", func(app *AppInstance, args *AppActionSender) int {
+	app.SetEventHandler("test", func(app AppImpl, args *AppActionSender) int {
 		return 0
 	})
 

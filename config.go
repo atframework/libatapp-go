@@ -19,7 +19,11 @@ import (
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
+
+	libatapp_types "github.com/atframework/libatapp-go/types"
 )
+
+type ConfigExistedIndex = libatapp_types.ConfigExistedIndex
 
 type LoadConfigOptions struct {
 	ReorderListIndexByField string
@@ -1163,34 +1167,6 @@ func parseField(inputData interface{}, fd protoreflect.FieldDescriptor, logger *
 	return convertField(inputData, minValue, maxValue, fd, logger)
 }
 
-type ConfigExistedIndex struct {
-	ExistedSet  map[string]struct{}
-	MapKeyIndex map[string]int
-}
-
-func (i *ConfigExistedIndex) MutableExistedSet() map[string]struct{} {
-	if i.ExistedSet == nil {
-		i.ExistedSet = make(map[string]struct{})
-	}
-
-	return i.ExistedSet
-}
-
-func (i *ConfigExistedIndex) MutableMapKeyIndex() map[string]int {
-	if i.MapKeyIndex == nil {
-		i.MapKeyIndex = make(map[string]int)
-	}
-
-	return i.MapKeyIndex
-}
-
-func CreateConfigExistedIndex() *ConfigExistedIndex {
-	return &ConfigExistedIndex{
-		ExistedSet:  make(map[string]struct{}),
-		MapKeyIndex: make(map[string]int),
-	}
-}
-
 func makeExistedMapKeyIndexKey(existedSetPrefix string, fd protoreflect.FieldDescriptor, mk protoreflect.MapKey) string {
 	keyFd := fd.MapKey()
 
@@ -2150,7 +2126,7 @@ func LoadDefaultConfigMessageFields(configPb proto.Message, logger *log.Logger,
 	}
 
 	if dumpExistedSet == nil {
-		dumpExistedSet = CreateConfigExistedIndex()
+		dumpExistedSet = libatapp_types.CreateConfigExistedIndex()
 	}
 
 	fields := configPb.ProtoReflect().Descriptor().Fields()

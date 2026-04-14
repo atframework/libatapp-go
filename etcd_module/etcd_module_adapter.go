@@ -1,4 +1,4 @@
-package libatapp
+package libatapp_etcd_module
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 
 	modulev2 "github.com/atframework/libatapp-go/etcd_module_v2"
 	pb "github.com/atframework/libatapp-go/protocol/atframe"
+
+	libatapp_types "github.com/atframework/libatapp-go/types"
 )
 
 var _ EtcdAppModuleImpl = (*etcdModuleAdapter)(nil)
@@ -18,7 +20,7 @@ var _ EtcdAppModuleImpl = (*etcdModuleAdapter)(nil)
 // Actor/CSP EtcdModule.  Config state that the new v2 does not expose is held
 // locally in this struct.
 type etcdModuleAdapter struct {
-	AppModuleBase
+	libatapp_types.AppModuleBase
 
 	mu   sync.RWMutex
 	impl *modulev2.EtcdModule
@@ -57,9 +59,9 @@ type etcdModuleAdapter struct {
 	registrations map[string]modulev2.ServiceInfo
 }
 
-func newEtcdModuleAdapter(owner AppImpl) *etcdModuleAdapter {
+func newEtcdModuleAdapter(owner libatapp_types.AppImpl) *etcdModuleAdapter {
 	a := &etcdModuleAdapter{
-		AppModuleBase:     CreateAppModuleBase(owner),
+		AppModuleBase:     libatapp_types.CreateAppModuleBase(owner),
 		nodeEventCbs:      make(map[EventCallbackHandle]NodeEventCallback),
 		topoEventCbs:      make(map[EventCallbackHandle]TopologyInfoEventCallback),
 		discSnapLoadCbs:   make(map[EventCallbackHandle]DiscoverySnapshotEventCallback),

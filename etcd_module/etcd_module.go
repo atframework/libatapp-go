@@ -1,8 +1,10 @@
-package libatapp
+package libatapp_etcd_module
 
 import (
 	modulev2 "github.com/atframework/libatapp-go/etcd_module_v2"
 	atframe_protocol "github.com/atframework/libatapp-go/protocol/atframe"
+
+	libatapp_types "github.com/atframework/libatapp-go/types"
 )
 
 // ============ EtcdModule 接口 ============
@@ -10,7 +12,7 @@ import (
 // EtcdAppModuleImpl defines the interface for the etcd service discovery module.
 // It extends AppModuleImpl with etcd-specific functionality.
 type EtcdAppModuleImpl interface {
-	AppModuleImpl
+	libatapp_types.AppModuleImpl
 	EtcdModuleImpl
 }
 
@@ -120,12 +122,14 @@ type TopologyWatcherSender struct {
 
 // ============ 回调类型 ============
 
-type DiscoveryWatcherListCallback func(*DiscoveryWatcherSender)
-type TopologyWatcherListCallback func(*TopologyWatcherSender)
-type DiscoverySnapshotEventCallback func(EtcdModuleImpl)
-type TopologySnapshotEventCallback func(EtcdModuleImpl)
-type NodeEventCallback func(EtcdDiscoveryAction, *EtcdDiscoveryNode)
-type TopologyInfoEventCallback func(EtcdWatchEvent, *atframe_protocol.AtappTopologyInfo, *EtcdDataVersion)
+type (
+	DiscoveryWatcherListCallback   func(*DiscoveryWatcherSender)
+	TopologyWatcherListCallback    func(*TopologyWatcherSender)
+	DiscoverySnapshotEventCallback func(EtcdModuleImpl)
+	TopologySnapshotEventCallback  func(EtcdModuleImpl)
+	NodeEventCallback              func(EtcdDiscoveryAction, *EtcdDiscoveryNode)
+	TopologyInfoEventCallback      func(EtcdWatchEvent, *atframe_protocol.AtappTopologyInfo, *EtcdDataVersion)
+)
 
 // EventCallbackHandle identifies a registered callback in this module.
 type EventCallbackHandle int64
@@ -214,7 +218,7 @@ type EtcdModuleImpl interface {
 	RemoveOnTopologySnapshotLoaded(handle EventCallbackHandle)
 }
 
-func CreateEtcdModule(app AppModuleImpl) EtcdAppModuleImpl {
+func CreateEtcdModule(app libatapp_types.AppModuleImpl) EtcdAppModuleImpl {
 	if app == nil {
 		return nil
 	}
