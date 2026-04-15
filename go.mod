@@ -3,7 +3,7 @@ module github.com/atframework/libatapp-go
 go 1.25.1
 
 require (
-	github.com/atframework/atframe-utils-go v1.0.0
+	github.com/atframework/atframe-utils-go v1.0.5-0.20260415103533-45bbe86218eb
 	github.com/panjf2000/ants/v2 v2.11.3
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/etcd/api/v3 v3.6.8

@@ -11,7 +11,7 @@ require (
 )
 
 require (
-	github.com/atframework/atframe-utils-go v1.0.0 // indirect
+	github.com/atframework/atframe-utils-go v1.0.5-0.20260415103533-45bbe86218eb // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

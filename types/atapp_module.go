@@ -3,6 +3,8 @@ package libatapp_types
 import (
 	"context"
 	"time"
+
+	lu "github.com/atframework/atframe-utils-go/lang_utility"
 )
 
 // App 应用接口
@@ -54,10 +56,8 @@ type AppModuleImpl interface {
 	Disable()
 }
 
-type noCopy struct{}
-
 type AppModuleBase struct {
-	_       noCopy
+	_       lu.NoCopy
 	owner   AppImpl
 	actived bool
 	enabled bool
