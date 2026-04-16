@@ -1,5 +1,5 @@
-github.com/atframework/atframe-utils-go v1.0.5-0.20260415103533-45bbe86218eb h1:wmcu70YVXDsBPhLWk7vUzZOSsWoTspiYd/gWJ74ReRI=
-github.com/atframework/atframe-utils-go v1.0.5-0.20260415103533-45bbe86218eb/go.mod h1:Nz9aqcllJkgj05rAoBMOhfQhoqUp/Xp636UX6OnJjuY=
+github.com/atframework/atframe-utils-go v1.0.5-0.20260416024202-66c04636f055 h1:ZwNtTx0QmoDkEuADXaSLyRJZ/VaRsPxKM0nXgRgic/o=
+github.com/atframework/atframe-utils-go v1.0.5-0.20260416024202-66c04636f055/go.mod h1:Nz9aqcllJkgj05rAoBMOhfQhoqUp/Xp636UX6OnJjuY=
 github.com/coreos/go-semver v0.3.1 h1:yi21YpKnrx1gt5R+la8n5WgS0kCrsPp33dmEyHReZr4=
 github.com/coreos/go-semver v0.3.1/go.mod h1:irMmmIw/7yzSRPWryHsK7EYSg09caPQL03VsM8rvUec=
 github.com/coreos/go-systemd/v22 v22.5.0 h1:RrqgGjYQKalulkV8NGVIfkXQf6YYmOyiJKk8iXXhfZs=
