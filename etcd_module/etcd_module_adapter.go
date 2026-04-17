@@ -1,6 +1,7 @@
 package libatapp_etcd_module
 
 import (
+	"container/list"
 	"context"
 	"os"
 	"strconv"
@@ -35,14 +36,15 @@ type etcdModuleAdapter struct {
 	cbMu  sync.Mutex
 	cbSeq atomic.Int64
 
-	nodeEventCbs map[EventCallbackHandle]NodeEventCallback
-	topoEventCbs map[EventCallbackHandle]TopologyInfoEventCallback
-
-	discSnapLoadCbs   map[EventCallbackHandle]DiscoverySnapshotEventCallback
-	discSnapLoadedCbs map[EventCallbackHandle]DiscoverySnapshotEventCallback
-
-	topoSnapLoadCbs   map[EventCallbackHandle]TopologySnapshotEventCallback
-	topoSnapLoadedCbs map[EventCallbackHandle]TopologySnapshotEventCallback
+	// Callbacks are stored in doubly-linked lists with a map from handle to
+	// list element, giving O(1) append, O(1) removal, and deterministic
+	// iteration order (map iteration in Go is randomized).
+	nodeEventCbs      orderedCallbacks[NodeEventCallback]
+	topoEventCbs      orderedCallbacks[TopologyInfoEventCallback]
+	discSnapLoadCbs   orderedCallbacks[DiscoverySnapshotEventCallback]
+	discSnapLoadedCbs orderedCallbacks[DiscoverySnapshotEventCallback]
+	topoSnapLoadCbs   orderedCallbacks[TopologySnapshotEventCallback]
+	topoSnapLoadedCbs orderedCallbacks[TopologySnapshotEventCallback]
 
 	// per-event watcher callbacks (registered before Start; subscribed on Init)
 	byIDWatcherCbs   []DiscoveryWatcherListCallback
@@ -61,16 +63,130 @@ type etcdModuleAdapter struct {
 
 func newEtcdModuleAdapter(owner libatapp_types.AppImpl) *etcdModuleAdapter {
 	a := &etcdModuleAdapter{
-		AppModuleBase:     libatapp_types.CreateAppModuleBase(owner),
-		nodeEventCbs:      make(map[EventCallbackHandle]NodeEventCallback),
-		topoEventCbs:      make(map[EventCallbackHandle]TopologyInfoEventCallback),
-		discSnapLoadCbs:   make(map[EventCallbackHandle]DiscoverySnapshotEventCallback),
-		discSnapLoadedCbs: make(map[EventCallbackHandle]DiscoverySnapshotEventCallback),
-		topoSnapLoadCbs:   make(map[EventCallbackHandle]TopologySnapshotEventCallback),
-		topoSnapLoadedCbs: make(map[EventCallbackHandle]TopologySnapshotEventCallback),
-		registrations:     make(map[string]modulev2.ServiceInfo),
+		AppModuleBase: libatapp_types.CreateAppModuleBase(owner),
+		registrations: make(map[string]modulev2.ServiceInfo),
 	}
 	return a
+}
+
+// ── callback registry entry types ─────────────────────────────────────────
+
+// orderedCallbacks is an insertion-ordered registry of callbacks keyed by
+// EventCallbackHandle. It provides O(1) add / remove / iterate-in-order and
+// is safe to use concurrently.
+//
+// Reentrancy semantics: add / remove called while a forEach is in progress
+// (including from inside a callback being dispatched) are deferred and
+// applied after the outermost forEach completes. The current dispatch round
+// therefore sees a stable list; new callbacks first fire on the next round
+// and removed callbacks still fire in the current round.
+type orderedCallbacks[T any] struct {
+	mu      sync.Mutex
+	list    *list.List
+	idx     map[EventCallbackHandle]*list.Element
+	firing  int
+	pending []pendingCallbackOp[T]
+}
+
+type orderedEntry[T any] struct {
+	handle EventCallbackHandle
+	fn     T
+}
+
+type pendingCallbackOpKind int
+
+const (
+	pendingCallbackAdd pendingCallbackOpKind = iota
+	pendingCallbackRemove
+)
+
+type pendingCallbackOp[T any] struct {
+	kind   pendingCallbackOpKind
+	handle EventCallbackHandle
+	fn     T
+}
+
+// add appends fn to the tail of the list and indexes it by handle.
+// If invoked while forEach is in progress, the operation is queued and
+// applied after the outermost forEach completes.
+func (o *orderedCallbacks[T]) add(handle EventCallbackHandle, fn T) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.firing > 0 {
+		o.pending = append(o.pending, pendingCallbackOp[T]{kind: pendingCallbackAdd, handle: handle, fn: fn})
+		return
+	}
+	o.addLocked(handle, fn)
+}
+
+// remove unlinks the entry identified by handle, if present.
+// If invoked while forEach is in progress, the operation is queued and
+// applied after the outermost forEach completes.
+func (o *orderedCallbacks[T]) remove(handle EventCallbackHandle) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.firing > 0 {
+		o.pending = append(o.pending, pendingCallbackOp[T]{kind: pendingCallbackRemove, handle: handle})
+		return
+	}
+	o.removeLocked(handle)
+}
+
+func (o *orderedCallbacks[T]) addLocked(handle EventCallbackHandle, fn T) {
+	if o.list == nil {
+		o.list = list.New()
+		o.idx = make(map[EventCallbackHandle]*list.Element)
+	}
+	e := o.list.PushBack(orderedEntry[T]{handle: handle, fn: fn})
+	o.idx[handle] = e
+}
+
+func (o *orderedCallbacks[T]) removeLocked(handle EventCallbackHandle) {
+	if o.idx == nil {
+		return
+	}
+	if e, ok := o.idx[handle]; ok {
+		o.list.Remove(e)
+		delete(o.idx, handle)
+	}
+}
+
+// forEach invokes visit for every registered callback in insertion order,
+// without allocating an intermediate slice. It is safe for visit to call
+// add / remove on the same registry; those operations are deferred until
+// the outermost forEach returns.
+func (o *orderedCallbacks[T]) forEach(visit func(T)) {
+	o.mu.Lock()
+	if o.list == nil {
+		o.mu.Unlock()
+		return
+	}
+	o.firing++
+	front := o.list.Front()
+	o.mu.Unlock()
+
+	// The list is structurally stable while firing > 0 (add / remove queue
+	// to pending under the mutex), so pointer-walking it here without the
+	// lock is safe.
+	for e := front; e != nil; e = e.Next() {
+		visit(e.Value.(orderedEntry[T]).fn)
+	}
+
+	o.mu.Lock()
+	o.firing--
+	if o.firing == 0 && len(o.pending) > 0 {
+		ops := o.pending
+		o.pending = nil
+		for _, p := range ops {
+			switch p.kind {
+			case pendingCallbackAdd:
+				o.addLocked(p.handle, p.fn)
+			case pendingCallbackRemove:
+				o.removeLocked(p.handle)
+			}
+		}
+	}
+	o.mu.Unlock()
 }
 
 // nextCbHandle allocates a unique EventCallbackHandle.
@@ -294,7 +410,6 @@ func (m *etcdModuleAdapter) Reload() error {
 	}
 	return m.replayRegistrations(ctx, impl)
 }
-
 
 func (m *etcdModuleAdapter) Stop() (bool, error) {
 	m.mu.RLock()
@@ -554,16 +669,12 @@ func (m *etcdModuleAdapter) AddOnNodeDiscoveryEvent(fn NodeEventCallback) EventC
 		return 0
 	}
 	h := m.nextCbHandle()
-	m.cbMu.Lock()
-	m.nodeEventCbs[h] = fn
-	m.cbMu.Unlock()
+	m.nodeEventCbs.add(h, fn)
 	return h
 }
 
 func (m *etcdModuleAdapter) RemoveOnNodeEvent(handle EventCallbackHandle) {
-	m.cbMu.Lock()
-	delete(m.nodeEventCbs, handle)
-	m.cbMu.Unlock()
+	m.nodeEventCbs.remove(handle)
 }
 
 // ── EtcdModuleImpl — topology info event callbacks ────────────────────────
@@ -573,16 +684,12 @@ func (m *etcdModuleAdapter) AddOnTopologyInfoEvent(fn TopologyInfoEventCallback)
 		return 0
 	}
 	h := m.nextCbHandle()
-	m.cbMu.Lock()
-	m.topoEventCbs[h] = fn
-	m.cbMu.Unlock()
+	m.topoEventCbs.add(h, fn)
 	return h
 }
 
 func (m *etcdModuleAdapter) RemoveOnTopologyInfoEvent(handle EventCallbackHandle) {
-	m.cbMu.Lock()
-	delete(m.topoEventCbs, handle)
-	m.cbMu.Unlock()
+	m.topoEventCbs.remove(handle)
 }
 
 // ── EtcdModuleImpl — global discovery ────────────────────────────────────
@@ -669,16 +776,12 @@ func (m *etcdModuleAdapter) AddOnLoadDiscoverySnapshot(fn DiscoverySnapshotEvent
 		return 0
 	}
 	h := m.nextCbHandle()
-	m.cbMu.Lock()
-	m.discSnapLoadCbs[h] = fn
-	m.cbMu.Unlock()
+	m.discSnapLoadCbs.add(h, fn)
 	return h
 }
 
 func (m *etcdModuleAdapter) RemoveOnLoadDiscoverySnapshot(handle EventCallbackHandle) {
-	m.cbMu.Lock()
-	delete(m.discSnapLoadCbs, handle)
-	m.cbMu.Unlock()
+	m.discSnapLoadCbs.remove(handle)
 }
 
 func (m *etcdModuleAdapter) AddOnDiscoverySnapshotLoaded(fn DiscoverySnapshotEventCallback) EventCallbackHandle {
@@ -686,16 +789,12 @@ func (m *etcdModuleAdapter) AddOnDiscoverySnapshotLoaded(fn DiscoverySnapshotEve
 		return 0
 	}
 	h := m.nextCbHandle()
-	m.cbMu.Lock()
-	m.discSnapLoadedCbs[h] = fn
-	m.cbMu.Unlock()
+	m.discSnapLoadedCbs.add(h, fn)
 	return h
 }
 
 func (m *etcdModuleAdapter) RemoveOnDiscoverySnapshotLoaded(handle EventCallbackHandle) {
-	m.cbMu.Lock()
-	delete(m.discSnapLoadedCbs, handle)
-	m.cbMu.Unlock()
+	m.discSnapLoadedCbs.remove(handle)
 }
 
 // ── EtcdModuleImpl — topology snapshot ───────────────────────────────────
@@ -716,16 +815,12 @@ func (m *etcdModuleAdapter) AddOnLoadTopologySnapshot(fn TopologySnapshotEventCa
 		return 0
 	}
 	h := m.nextCbHandle()
-	m.cbMu.Lock()
-	m.topoSnapLoadCbs[h] = fn
-	m.cbMu.Unlock()
+	m.topoSnapLoadCbs.add(h, fn)
 	return h
 }
 
 func (m *etcdModuleAdapter) RemoveOnLoadTopologySnapshot(handle EventCallbackHandle) {
-	m.cbMu.Lock()
-	delete(m.topoSnapLoadCbs, handle)
-	m.cbMu.Unlock()
+	m.topoSnapLoadCbs.remove(handle)
 }
 
 func (m *etcdModuleAdapter) AddOnTopologySnapshotLoaded(fn TopologySnapshotEventCallback) EventCallbackHandle {
@@ -733,16 +828,12 @@ func (m *etcdModuleAdapter) AddOnTopologySnapshotLoaded(fn TopologySnapshotEvent
 		return 0
 	}
 	h := m.nextCbHandle()
-	m.cbMu.Lock()
-	m.topoSnapLoadedCbs[h] = fn
-	m.cbMu.Unlock()
+	m.topoSnapLoadedCbs.add(h, fn)
 	return h
 }
 
 func (m *etcdModuleAdapter) RemoveOnTopologySnapshotLoaded(handle EventCallbackHandle) {
-	m.cbMu.Lock()
-	delete(m.topoSnapLoadedCbs, handle)
-	m.cbMu.Unlock()
+	m.topoSnapLoadedCbs.remove(handle)
 }
 
 // ── Snapshot diff handler ─────────────────────────────────────────────────
@@ -867,32 +958,21 @@ func (m *etcdModuleAdapter) fireNodeCallbacks(action EtcdDiscoveryAction, node *
 	// When prefixes are unconfigured, fall back to firing both groups.
 	fireAll := !isById && !isByName
 
+	sender := &DiscoveryWatcherSender{Module: m, Node: nodeInfo}
+
+	m.nodeEventCbs.forEach(func(fn NodeEventCallback) { fn(action, node) })
+
 	m.cbMu.Lock()
-	nodeCbs := make([]NodeEventCallback, 0, len(m.nodeEventCbs))
-	for _, fn := range m.nodeEventCbs {
-		nodeCbs = append(nodeCbs, fn)
-	}
-	var byIDCbs []DiscoveryWatcherListCallback
-	var byNameCbs []DiscoveryWatcherListCallback
+	defer m.cbMu.Unlock()
 	if isById || fireAll {
-		byIDCbs = make([]DiscoveryWatcherListCallback, len(m.byIDWatcherCbs))
-		copy(byIDCbs, m.byIDWatcherCbs)
+		for _, fn := range m.byIDWatcherCbs {
+			fn(sender)
+		}
 	}
 	if isByName || fireAll {
-		byNameCbs = make([]DiscoveryWatcherListCallback, len(m.byNameWatcherCbs))
-		copy(byNameCbs, m.byNameWatcherCbs)
-	}
-	m.cbMu.Unlock()
-
-	sender := &DiscoveryWatcherSender{Module: m, Node: nodeInfo}
-	for _, fn := range nodeCbs {
-		fn(action, node)
-	}
-	for _, fn := range byIDCbs {
-		fn(sender)
-	}
-	for _, fn := range byNameCbs {
-		fn(sender)
+		for _, fn := range m.byNameWatcherCbs {
+			fn(sender)
+		}
 	}
 }
 
@@ -915,70 +995,31 @@ func (m *etcdModuleAdapter) fireTopologyCallbacks(eventType EtcdWatchEvent, node
 		Version:        node.Version,
 	}
 
-	m.cbMu.Lock()
-	topologyInfoCallbacks := make([]TopologyInfoEventCallback, 0, len(m.topoEventCbs))
-	for _, fn := range m.topoEventCbs {
-		topologyInfoCallbacks = append(topologyInfoCallbacks, fn)
-	}
-	topologyWatcherCallbacks := make([]TopologyWatcherListCallback, len(m.topoWatcherCbs))
-	copy(topologyWatcherCallbacks, m.topoWatcherCbs)
-	m.cbMu.Unlock()
-
 	sender := &TopologyWatcherSender{Module: m, Topology: topologyStorage, Action: eventType}
-	for _, fn := range topologyInfoCallbacks {
-		fn(eventType, node.Info, version)
-	}
-	for _, fn := range topologyWatcherCallbacks {
+
+	m.topoEventCbs.forEach(func(fn TopologyInfoEventCallback) { fn(eventType, node.Info, version) })
+
+	m.cbMu.Lock()
+	defer m.cbMu.Unlock()
+	for _, fn := range m.topoWatcherCbs {
 		fn(sender)
 	}
 }
 
 func (m *etcdModuleAdapter) fireDiscSnapLoadCbs() {
-	m.cbMu.Lock()
-	cbs := make([]DiscoverySnapshotEventCallback, 0, len(m.discSnapLoadCbs))
-	for _, fn := range m.discSnapLoadCbs {
-		cbs = append(cbs, fn)
-	}
-	m.cbMu.Unlock()
-	for _, fn := range cbs {
-		fn(m)
-	}
+	m.discSnapLoadCbs.forEach(func(fn DiscoverySnapshotEventCallback) { fn(m) })
 }
 
 func (m *etcdModuleAdapter) fireDiscSnapLoadedCbs() {
-	m.cbMu.Lock()
-	cbs := make([]DiscoverySnapshotEventCallback, 0, len(m.discSnapLoadedCbs))
-	for _, fn := range m.discSnapLoadedCbs {
-		cbs = append(cbs, fn)
-	}
-	m.cbMu.Unlock()
-	for _, fn := range cbs {
-		fn(m)
-	}
+	m.discSnapLoadedCbs.forEach(func(fn DiscoverySnapshotEventCallback) { fn(m) })
 }
 
 func (m *etcdModuleAdapter) fireTopologySnapLoadCbs() {
-	m.cbMu.Lock()
-	cbs := make([]TopologySnapshotEventCallback, 0, len(m.topoSnapLoadCbs))
-	for _, fn := range m.topoSnapLoadCbs {
-		cbs = append(cbs, fn)
-	}
-	m.cbMu.Unlock()
-	for _, fn := range cbs {
-		fn(m)
-	}
+	m.topoSnapLoadCbs.forEach(func(fn TopologySnapshotEventCallback) { fn(m) })
 }
 
 func (m *etcdModuleAdapter) fireTopologySnapLoadedCbs() {
-	m.cbMu.Lock()
-	cbs := make([]TopologySnapshotEventCallback, 0, len(m.topoSnapLoadedCbs))
-	for _, fn := range m.topoSnapLoadedCbs {
-		cbs = append(cbs, fn)
-	}
-	m.cbMu.Unlock()
-	for _, fn := range cbs {
-		fn(m)
-	}
+	m.topoSnapLoadedCbs.forEach(func(fn TopologySnapshotEventCallback) { fn(m) })
 }
 
 // ── Proto equality helpers ────────────────────────────────────────────────

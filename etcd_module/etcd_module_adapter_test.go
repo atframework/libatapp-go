@@ -370,19 +370,99 @@ func TestEtcdModuleAdapter_RemoveOnNodeEvent_StopsDispatch(t *testing.T) {
 func TestEtcdModuleAdapter_NodeDiscoveryEvent_MultiCallbacks_FiredInOrder(t *testing.T) {
 	// ── Arrange ───────────────────────────────────────────────────────────
 	a := newEtcdModuleAdapter(nil)
-	callOrder := make([]int, 0, 3)
-	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) { callOrder = append(callOrder, 1) })
-	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) { callOrder = append(callOrder, 2) })
-	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) { callOrder = append(callOrder, 3) })
+
+	testCount := 32
+	callOrder := make([]int, 0, testCount)
+	expectOrder := make([]int, 0, testCount)
+	for i := 1; i <= testCount; i++ {
+		idx := i // capture loop variable
+		expectOrder = append(expectOrder, idx)
+		a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) { callOrder = append(callOrder, idx) })
+	}
 
 	// ── Act ───────────────────────────────────────────────────────────────
 	a.onSnapshotPublished(makeDiscSnap(discNode("/svc/by_id/1", 1, "node-1")))
 
 	// ── Assert ────────────────────────────────────────────────────────────
-	assert.Equal(t, []int{1, 2, 3}, callOrder, "3个回调必须按注册顺序全部触发")
+	assert.Equal(t, expectOrder, callOrder, "回调必须按注册顺序全部触发")
 }
 
-// ── core path: Discovery watcher callbacks ────────────────────────────────
+// TestEtcdModuleAdapter_NodeDiscoveryEvent_AddDuringFire_DeferredToNextRound
+// 验证：在回调执行期间注册的新回调，本轮事件不会触发它；下一轮事件才生效。
+func TestEtcdModuleAdapter_NodeDiscoveryEvent_AddDuringFire_DeferredToNextRound(t *testing.T) {
+	a := newEtcdModuleAdapter(nil)
+
+	var lateFired int
+	var addedHandle EventCallbackHandle
+	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) {
+		if addedHandle == 0 {
+			addedHandle = a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) {
+				lateFired++
+			})
+		}
+	})
+
+	// 第一轮：仅原回调触发，新回调被延迟。
+	a.onSnapshotPublished(makeDiscSnap(discNode("/svc/by_id/1", 1, "n1")))
+	assert.Equal(t, 0, lateFired, "本轮新增的回调不应在本轮触发")
+	assert.NotEqual(t, EventCallbackHandle(0), addedHandle, "新回调应已注册成功")
+
+	// 第二轮：新回调应生效（节点改名触发 Put）。
+	a.onSnapshotPublished(makeDiscSnap(discNode("/svc/by_id/1", 1, "n1-renamed")))
+	assert.Equal(t, 1, lateFired, "下一轮事件应触发新回调")
+}
+
+// TestEtcdModuleAdapter_NodeDiscoveryEvent_RemoveDuringFire_StillFiresCurrentRound
+// 验证：在回调执行期间 Remove 已注册的回调，本轮该回调仍会触发（移除被延迟），
+// 下一轮才真正停止触发。
+func TestEtcdModuleAdapter_NodeDiscoveryEvent_RemoveDuringFire_StillFiresCurrentRound(t *testing.T) {
+	a := newEtcdModuleAdapter(nil)
+
+	var victimFired int
+	var victimHandle EventCallbackHandle
+	victimHandle = a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) {
+		victimFired++
+	})
+	// 注册顺序：victim 在前，remover 在后 —— 先执行 victim 再执行 remover。
+	a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) {
+		a.RemoveOnNodeEvent(victimHandle)
+	})
+
+	// 第一轮：victim 本轮仍触发（移除被延迟），之后 remover 入队移除操作。
+	a.onSnapshotPublished(makeDiscSnap(discNode("/svc/by_id/1", 1, "n1")))
+	assert.Equal(t, 1, victimFired, "被移除的回调本轮仍应触发")
+
+	// 第二轮：victim 已真正被移除，不再触发。
+	a.onSnapshotPublished(makeDiscSnap(discNode("/svc/by_id/1", 1, "n1-renamed")))
+	assert.Equal(t, 1, victimFired, "下一轮 victim 不应再触发")
+}
+
+// TestEtcdModuleAdapter_NodeDiscoveryEvent_AddRemoveDuringFire_NoDeadlock
+// 验证：回调内 Add/Remove 不会因锁重入而死锁，多轮派发保持注册顺序语义。
+func TestEtcdModuleAdapter_NodeDiscoveryEvent_AddRemoveDuringFire_NoDeadlock(t *testing.T) {
+	a := newEtcdModuleAdapter(nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var added EventCallbackHandle
+		h := a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) {
+			if added == 0 {
+				added = a.AddOnNodeDiscoveryEvent(func(EtcdDiscoveryAction, *EtcdDiscoveryNode) {})
+			}
+		})
+		a.onSnapshotPublished(makeDiscSnap(discNode("/svc/by_id/1", 1, "n1")))
+		a.RemoveOnNodeEvent(h)
+		if added != 0 {
+			a.RemoveOnNodeEvent(added)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Add/Remove during fire caused a deadlock")
+	}
+}
 
 func TestEtcdModuleAdapter_ByIDWatcher_FiredOnNodeUp(t *testing.T) {
 	a := newEtcdModuleAdapter(nil)

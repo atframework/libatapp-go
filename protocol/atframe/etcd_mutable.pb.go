@@ -689,7 +689,7 @@ func (m *EtcdClusterConf) MutableEndpoints() []string {
 }
 
 // ===== ReverseIfNil methods for EtcdClusterConf ===== Repeated =====
-func (m *EtcdClusterConf) ReverseIfNilEndpoints(l int) []string {
+func (m *EtcdClusterConf) ReverseIfNilEndpoints(l int32) []string {
 	if m.Endpoints == nil {
 		m.Endpoints = make([]string, 0, l)
 	}
@@ -700,14 +700,6 @@ func (m *EtcdClusterConf) ReverseIfNilEndpoints(l int) []string {
 func (m *EtcdClusterConf) AppendEndpoints(d string) {
 	if m.Endpoints == nil {
 		m.Endpoints = []string{}
-	}
-	m.Endpoints = append(m.Endpoints, d)
-}
-
-// ===== Append methods for EtcdClusterConf ===== Repeated =====
-func (m *EtcdClusterConf) AppendAndReverseEndpoints(l int, d string) {
-	if m.Endpoints == nil {
-		m.Endpoints = make([]string, 0, l)
 	}
 	m.Endpoints = append(m.Endpoints, d)
 }
@@ -1544,7 +1536,7 @@ func (m *EtcdGateway) MutableMatchHosts() []string {
 }
 
 // ===== ReverseIfNil methods for EtcdGateway ===== Repeated =====
-func (m *EtcdGateway) ReverseIfNilMatchHosts(l int) []string {
+func (m *EtcdGateway) ReverseIfNilMatchHosts(l int32) []string {
 	if m.MatchHosts == nil {
 		m.MatchHosts = make([]string, 0, l)
 	}
@@ -1555,14 +1547,6 @@ func (m *EtcdGateway) ReverseIfNilMatchHosts(l int) []string {
 func (m *EtcdGateway) AppendMatchHosts(d string) {
 	if m.MatchHosts == nil {
 		m.MatchHosts = []string{}
-	}
-	m.MatchHosts = append(m.MatchHosts, d)
-}
-
-// ===== Append methods for EtcdGateway ===== Repeated =====
-func (m *EtcdGateway) AppendAndReverseMatchHosts(l int, d string) {
-	if m.MatchHosts == nil {
-		m.MatchHosts = make([]string, 0, l)
 	}
 	m.MatchHosts = append(m.MatchHosts, d)
 }
@@ -1595,7 +1579,7 @@ func (m *EtcdGateway) MutableMatchNamespaces() []string {
 }
 
 // ===== ReverseIfNil methods for EtcdGateway ===== Repeated =====
-func (m *EtcdGateway) ReverseIfNilMatchNamespaces(l int) []string {
+func (m *EtcdGateway) ReverseIfNilMatchNamespaces(l int32) []string {
 	if m.MatchNamespaces == nil {
 		m.MatchNamespaces = make([]string, 0, l)
 	}
@@ -1606,14 +1590,6 @@ func (m *EtcdGateway) ReverseIfNilMatchNamespaces(l int) []string {
 func (m *EtcdGateway) AppendMatchNamespaces(d string) {
 	if m.MatchNamespaces == nil {
 		m.MatchNamespaces = []string{}
-	}
-	m.MatchNamespaces = append(m.MatchNamespaces, d)
-}
-
-// ===== Append methods for EtcdGateway ===== Repeated =====
-func (m *EtcdGateway) AppendAndReverseMatchNamespaces(l int, d string) {
-	if m.MatchNamespaces == nil {
-		m.MatchNamespaces = make([]string, 0, l)
 	}
 	m.MatchNamespaces = append(m.MatchNamespaces, d)
 }
@@ -1919,7 +1895,7 @@ func (m *EtcdDiscoveryNode) MutableListen() []string {
 }
 
 // ===== ReverseIfNil methods for EtcdDiscoveryNode ===== Repeated =====
-func (m *EtcdDiscoveryNode) ReverseIfNilListen(l int) []string {
+func (m *EtcdDiscoveryNode) ReverseIfNilListen(l int32) []string {
 	if m.Listen == nil {
 		m.Listen = make([]string, 0, l)
 	}
@@ -1930,14 +1906,6 @@ func (m *EtcdDiscoveryNode) ReverseIfNilListen(l int) []string {
 func (m *EtcdDiscoveryNode) AppendListen(d string) {
 	if m.Listen == nil {
 		m.Listen = []string{}
-	}
-	m.Listen = append(m.Listen, d)
-}
-
-// ===== Append methods for EtcdDiscoveryNode ===== Repeated =====
-func (m *EtcdDiscoveryNode) AppendAndReverseListen(l int, d string) {
-	if m.Listen == nil {
-		m.Listen = make([]string, 0, l)
 	}
 	m.Listen = append(m.Listen, d)
 }
@@ -1978,7 +1946,7 @@ func (m *EtcdDiscoveryNode) MutableGateways() []*EtcdGateway {
 }
 
 // ===== ReverseIfNil methods for EtcdDiscoveryNode ===== Repeated =====
-func (m *EtcdDiscoveryNode) ReverseIfNilGateways(l int) []*EtcdGateway {
+func (m *EtcdDiscoveryNode) ReverseIfNilGateways(l int32) []*EtcdGateway {
 	if m.Gateways == nil {
 		m.Gateways = make([]*EtcdGateway, 0, l)
 	}
@@ -1989,14 +1957,6 @@ func (m *EtcdDiscoveryNode) ReverseIfNilGateways(l int) []*EtcdGateway {
 func (m *EtcdDiscoveryNode) AppendGateways(d *EtcdGateway) {
 	if m.Gateways == nil {
 		m.Gateways = []*EtcdGateway{}
-	}
-	m.Gateways = append(m.Gateways, d)
-}
-
-// ===== Append methods for EtcdDiscoveryNode ===== Repeated =====
-func (m *EtcdDiscoveryNode) AppendAndReverseGateways(l int, d *EtcdGateway) {
-	if m.Gateways == nil {
-		m.Gateways = make([]*EtcdGateway, 0, l)
 	}
 	m.Gateways = append(m.Gateways, d)
 }
