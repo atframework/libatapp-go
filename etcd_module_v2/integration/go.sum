@@ -1,5 +1,5 @@
-github.com/atframework/atframe-utils-go v1.0.5-0.20260415103533-45bbe86218eb h1:wmcu70YVXDsBPhLWk7vUzZOSsWoTspiYd/gWJ74ReRI=
-github.com/atframework/atframe-utils-go v1.0.5-0.20260415103533-45bbe86218eb/go.mod h1:Nz9aqcllJkgj05rAoBMOhfQhoqUp/Xp636UX6OnJjuY=
+github.com/atframework/atframe-utils-go v1.0.5-0.20260416024202-66c04636f055 h1:ZwNtTx0QmoDkEuADXaSLyRJZ/VaRsPxKM0nXgRgic/o=
+github.com/atframework/atframe-utils-go v1.0.5-0.20260416024202-66c04636f055/go.mod h1:Nz9aqcllJkgj05rAoBMOhfQhoqUp/Xp636UX6OnJjuY=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/cenkalti/backoff/v4 v4.3.0 h1:MyRJ/UdXutAwSAT+s3wNd7MfTIcy71VQueUuFK343L8=

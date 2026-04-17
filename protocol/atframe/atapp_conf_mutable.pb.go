@@ -360,7 +360,7 @@ func (m *AtappConfigureEnumvalueOptions) MutableAliasName() []string {
 }
 
 // ===== ReverseIfNil methods for AtappConfigureEnumvalueOptions ===== Repeated =====
-func (m *AtappConfigureEnumvalueOptions) ReverseIfNilAliasName(l int32) []string {
+func (m *AtappConfigureEnumvalueOptions) ReverseIfNilAliasName(l int) []string {
 	if m.AliasName == nil {
 		m.AliasName = make([]string, 0, l)
 	}
@@ -371,6 +371,14 @@ func (m *AtappConfigureEnumvalueOptions) ReverseIfNilAliasName(l int32) []string
 func (m *AtappConfigureEnumvalueOptions) AppendAliasName(d string) {
 	if m.AliasName == nil {
 		m.AliasName = []string{}
+	}
+	m.AliasName = append(m.AliasName, d)
+}
+
+// ===== Append methods for AtappConfigureEnumvalueOptions ===== Repeated =====
+func (m *AtappConfigureEnumvalueOptions) AppendAndReverseAliasName(l int, d string) {
+	if m.AliasName == nil {
+		m.AliasName = make([]string, 0, l)
 	}
 	m.AliasName = append(m.AliasName, d)
 }
@@ -631,7 +639,7 @@ func (m *AtappGateway) MutableMatchHosts() []string {
 }
 
 // ===== ReverseIfNil methods for AtappGateway ===== Repeated =====
-func (m *AtappGateway) ReverseIfNilMatchHosts(l int32) []string {
+func (m *AtappGateway) ReverseIfNilMatchHosts(l int) []string {
 	if m.MatchHosts == nil {
 		m.MatchHosts = make([]string, 0, l)
 	}
@@ -642,6 +650,14 @@ func (m *AtappGateway) ReverseIfNilMatchHosts(l int32) []string {
 func (m *AtappGateway) AppendMatchHosts(d string) {
 	if m.MatchHosts == nil {
 		m.MatchHosts = []string{}
+	}
+	m.MatchHosts = append(m.MatchHosts, d)
+}
+
+// ===== Append methods for AtappGateway ===== Repeated =====
+func (m *AtappGateway) AppendAndReverseMatchHosts(l int, d string) {
+	if m.MatchHosts == nil {
+		m.MatchHosts = make([]string, 0, l)
 	}
 	m.MatchHosts = append(m.MatchHosts, d)
 }
@@ -674,7 +690,7 @@ func (m *AtappGateway) MutableMatchNamespaces() []string {
 }
 
 // ===== ReverseIfNil methods for AtappGateway ===== Repeated =====
-func (m *AtappGateway) ReverseIfNilMatchNamespaces(l int32) []string {
+func (m *AtappGateway) ReverseIfNilMatchNamespaces(l int) []string {
 	if m.MatchNamespaces == nil {
 		m.MatchNamespaces = make([]string, 0, l)
 	}
@@ -685,6 +701,14 @@ func (m *AtappGateway) ReverseIfNilMatchNamespaces(l int32) []string {
 func (m *AtappGateway) AppendMatchNamespaces(d string) {
 	if m.MatchNamespaces == nil {
 		m.MatchNamespaces = []string{}
+	}
+	m.MatchNamespaces = append(m.MatchNamespaces, d)
+}
+
+// ===== Append methods for AtappGateway ===== Repeated =====
+func (m *AtappGateway) AppendAndReverseMatchNamespaces(l int, d string) {
+	if m.MatchNamespaces == nil {
+		m.MatchNamespaces = make([]string, 0, l)
 	}
 	m.MatchNamespaces = append(m.MatchNamespaces, d)
 }
@@ -842,7 +866,7 @@ func (m *AtbusCrypto) MutableAlgorithm() []ATAPP_CRYPTO_ALGORITHM_TYPE {
 }
 
 // ===== ReverseIfNil methods for AtbusCrypto ===== Repeated =====
-func (m *AtbusCrypto) ReverseIfNilAlgorithm(l int32) []ATAPP_CRYPTO_ALGORITHM_TYPE {
+func (m *AtbusCrypto) ReverseIfNilAlgorithm(l int) []ATAPP_CRYPTO_ALGORITHM_TYPE {
 	if m.Algorithm == nil {
 		m.Algorithm = make([]ATAPP_CRYPTO_ALGORITHM_TYPE, 0, l)
 	}
@@ -853,6 +877,14 @@ func (m *AtbusCrypto) ReverseIfNilAlgorithm(l int32) []ATAPP_CRYPTO_ALGORITHM_TY
 func (m *AtbusCrypto) AppendAlgorithm(d ATAPP_CRYPTO_ALGORITHM_TYPE) {
 	if m.Algorithm == nil {
 		m.Algorithm = []ATAPP_CRYPTO_ALGORITHM_TYPE{}
+	}
+	m.Algorithm = append(m.Algorithm, d)
+}
+
+// ===== Append methods for AtbusCrypto ===== Repeated =====
+func (m *AtbusCrypto) AppendAndReverseAlgorithm(l int, d ATAPP_CRYPTO_ALGORITHM_TYPE) {
+	if m.Algorithm == nil {
+		m.Algorithm = make([]ATAPP_CRYPTO_ALGORITHM_TYPE, 0, l)
 	}
 	m.Algorithm = append(m.Algorithm, d)
 }
@@ -980,7 +1012,7 @@ func (m *AtbusCompression) MutableAlgorithm() []ATAPP_COMPRESSION_ALGORITHM_TYPE
 }
 
 // ===== ReverseIfNil methods for AtbusCompression ===== Repeated =====
-func (m *AtbusCompression) ReverseIfNilAlgorithm(l int32) []ATAPP_COMPRESSION_ALGORITHM_TYPE {
+func (m *AtbusCompression) ReverseIfNilAlgorithm(l int) []ATAPP_COMPRESSION_ALGORITHM_TYPE {
 	if m.Algorithm == nil {
 		m.Algorithm = make([]ATAPP_COMPRESSION_ALGORITHM_TYPE, 0, l)
 	}
@@ -991,6 +1023,14 @@ func (m *AtbusCompression) ReverseIfNilAlgorithm(l int32) []ATAPP_COMPRESSION_AL
 func (m *AtbusCompression) AppendAlgorithm(d ATAPP_COMPRESSION_ALGORITHM_TYPE) {
 	if m.Algorithm == nil {
 		m.Algorithm = []ATAPP_COMPRESSION_ALGORITHM_TYPE{}
+	}
+	m.Algorithm = append(m.Algorithm, d)
+}
+
+// ===== Append methods for AtbusCompression ===== Repeated =====
+func (m *AtbusCompression) AppendAndReverseAlgorithm(l int, d ATAPP_COMPRESSION_ALGORITHM_TYPE) {
+	if m.Algorithm == nil {
+		m.Algorithm = make([]ATAPP_COMPRESSION_ALGORITHM_TYPE, 0, l)
 	}
 	m.Algorithm = append(m.Algorithm, d)
 }
@@ -1108,7 +1148,7 @@ func (m *AtbusTopologyLabelData) MutableValue() []string {
 }
 
 // ===== ReverseIfNil methods for AtbusTopologyLabelData ===== Repeated =====
-func (m *AtbusTopologyLabelData) ReverseIfNilValue(l int32) []string {
+func (m *AtbusTopologyLabelData) ReverseIfNilValue(l int) []string {
 	if m.Value == nil {
 		m.Value = make([]string, 0, l)
 	}
@@ -1119,6 +1159,14 @@ func (m *AtbusTopologyLabelData) ReverseIfNilValue(l int32) []string {
 func (m *AtbusTopologyLabelData) AppendValue(d string) {
 	if m.Value == nil {
 		m.Value = []string{}
+	}
+	m.Value = append(m.Value, d)
+}
+
+// ===== Append methods for AtbusTopologyLabelData ===== Repeated =====
+func (m *AtbusTopologyLabelData) AppendAndReverseValue(l int, d string) {
+	if m.Value == nil {
+		m.Value = make([]string, 0, l)
 	}
 	m.Value = append(m.Value, d)
 }
@@ -1867,7 +1915,7 @@ func (m *AtbusConfigure) MutableListen() []string {
 }
 
 // ===== ReverseIfNil methods for AtbusConfigure ===== Repeated =====
-func (m *AtbusConfigure) ReverseIfNilListen(l int32) []string {
+func (m *AtbusConfigure) ReverseIfNilListen(l int) []string {
 	if m.Listen == nil {
 		m.Listen = make([]string, 0, l)
 	}
@@ -1878,6 +1926,14 @@ func (m *AtbusConfigure) ReverseIfNilListen(l int32) []string {
 func (m *AtbusConfigure) AppendListen(d string) {
 	if m.Listen == nil {
 		m.Listen = []string{}
+	}
+	m.Listen = append(m.Listen, d)
+}
+
+// ===== Append methods for AtbusConfigure ===== Repeated =====
+func (m *AtbusConfigure) AppendAndReverseListen(l int, d string) {
+	if m.Listen == nil {
+		m.Listen = make([]string, 0, l)
 	}
 	m.Listen = append(m.Listen, d)
 }
@@ -1910,7 +1966,7 @@ func (m *AtbusConfigure) MutableAccessTokens() []string {
 }
 
 // ===== ReverseIfNil methods for AtbusConfigure ===== Repeated =====
-func (m *AtbusConfigure) ReverseIfNilAccessTokens(l int32) []string {
+func (m *AtbusConfigure) ReverseIfNilAccessTokens(l int) []string {
 	if m.AccessTokens == nil {
 		m.AccessTokens = make([]string, 0, l)
 	}
@@ -1921,6 +1977,14 @@ func (m *AtbusConfigure) ReverseIfNilAccessTokens(l int32) []string {
 func (m *AtbusConfigure) AppendAccessTokens(d string) {
 	if m.AccessTokens == nil {
 		m.AccessTokens = []string{}
+	}
+	m.AccessTokens = append(m.AccessTokens, d)
+}
+
+// ===== Append methods for AtbusConfigure ===== Repeated =====
+func (m *AtbusConfigure) AppendAndReverseAccessTokens(l int, d string) {
+	if m.AccessTokens == nil {
+		m.AccessTokens = make([]string, 0, l)
 	}
 	m.AccessTokens = append(m.AccessTokens, d)
 }
@@ -1953,7 +2017,7 @@ func (m *AtbusConfigure) MutableGateways() []*AtappGateway {
 }
 
 // ===== ReverseIfNil methods for AtbusConfigure ===== Repeated =====
-func (m *AtbusConfigure) ReverseIfNilGateways(l int32) []*AtappGateway {
+func (m *AtbusConfigure) ReverseIfNilGateways(l int) []*AtappGateway {
 	if m.Gateways == nil {
 		m.Gateways = make([]*AtappGateway, 0, l)
 	}
@@ -1964,6 +2028,14 @@ func (m *AtbusConfigure) ReverseIfNilGateways(l int32) []*AtappGateway {
 func (m *AtbusConfigure) AppendGateways(d *AtappGateway) {
 	if m.Gateways == nil {
 		m.Gateways = []*AtappGateway{}
+	}
+	m.Gateways = append(m.Gateways, d)
+}
+
+// ===== Append methods for AtbusConfigure ===== Repeated =====
+func (m *AtbusConfigure) AppendAndReverseGateways(l int, d *AtappGateway) {
+	if m.Gateways == nil {
+		m.Gateways = make([]*AtappGateway, 0, l)
 	}
 	m.Gateways = append(m.Gateways, d)
 }
@@ -2850,7 +2922,7 @@ func (m *AtappLogSinkSyslog) MutableOptions() []string {
 }
 
 // ===== ReverseIfNil methods for AtappLogSinkSyslog ===== Repeated =====
-func (m *AtappLogSinkSyslog) ReverseIfNilOptions(l int32) []string {
+func (m *AtappLogSinkSyslog) ReverseIfNilOptions(l int) []string {
 	if m.Options == nil {
 		m.Options = make([]string, 0, l)
 	}
@@ -2861,6 +2933,14 @@ func (m *AtappLogSinkSyslog) ReverseIfNilOptions(l int32) []string {
 func (m *AtappLogSinkSyslog) AppendOptions(d string) {
 	if m.Options == nil {
 		m.Options = []string{}
+	}
+	m.Options = append(m.Options, d)
+}
+
+// ===== Append methods for AtappLogSinkSyslog ===== Repeated =====
+func (m *AtappLogSinkSyslog) AppendAndReverseOptions(l int, d string) {
+	if m.Options == nil {
+		m.Options = make([]string, 0, l)
 	}
 	m.Options = append(m.Options, d)
 }
@@ -3551,7 +3631,7 @@ func (m *AtappLogCategory) MutableSink() []*AtappLogSink {
 }
 
 // ===== ReverseIfNil methods for AtappLogCategory ===== Repeated =====
-func (m *AtappLogCategory) ReverseIfNilSink(l int32) []*AtappLogSink {
+func (m *AtappLogCategory) ReverseIfNilSink(l int) []*AtappLogSink {
 	if m.Sink == nil {
 		m.Sink = make([]*AtappLogSink, 0, l)
 	}
@@ -3562,6 +3642,14 @@ func (m *AtappLogCategory) ReverseIfNilSink(l int32) []*AtappLogSink {
 func (m *AtappLogCategory) AppendSink(d *AtappLogSink) {
 	if m.Sink == nil {
 		m.Sink = []*AtappLogSink{}
+	}
+	m.Sink = append(m.Sink, d)
+}
+
+// ===== Append methods for AtappLogCategory ===== Repeated =====
+func (m *AtappLogCategory) AppendAndReverseSink(l int, d *AtappLogSink) {
+	if m.Sink == nil {
+		m.Sink = make([]*AtappLogSink, 0, l)
 	}
 	m.Sink = append(m.Sink, d)
 }
@@ -3715,7 +3803,7 @@ func (m *AtappLog) MutableCategory() []*AtappLogCategory {
 }
 
 // ===== ReverseIfNil methods for AtappLog ===== Repeated =====
-func (m *AtappLog) ReverseIfNilCategory(l int32) []*AtappLogCategory {
+func (m *AtappLog) ReverseIfNilCategory(l int) []*AtappLogCategory {
 	if m.Category == nil {
 		m.Category = make([]*AtappLogCategory, 0, l)
 	}
@@ -3726,6 +3814,14 @@ func (m *AtappLog) ReverseIfNilCategory(l int32) []*AtappLogCategory {
 func (m *AtappLog) AppendCategory(d *AtappLogCategory) {
 	if m.Category == nil {
 		m.Category = []*AtappLogCategory{}
+	}
+	m.Category = append(m.Category, d)
+}
+
+// ===== Append methods for AtappLog ===== Repeated =====
+func (m *AtappLog) AppendAndReverseCategory(l int, d *AtappLogCategory) {
+	if m.Category == nil {
+		m.Category = make([]*AtappLogCategory, 0, l)
 	}
 	m.Category = append(m.Category, d)
 }
@@ -5199,7 +5295,7 @@ func (m *AtappEtcd) MutableHosts() []string {
 }
 
 // ===== ReverseIfNil methods for AtappEtcd ===== Repeated =====
-func (m *AtappEtcd) ReverseIfNilHosts(l int32) []string {
+func (m *AtappEtcd) ReverseIfNilHosts(l int) []string {
 	if m.Hosts == nil {
 		m.Hosts = make([]string, 0, l)
 	}
@@ -5210,6 +5306,14 @@ func (m *AtappEtcd) ReverseIfNilHosts(l int32) []string {
 func (m *AtappEtcd) AppendHosts(d string) {
 	if m.Hosts == nil {
 		m.Hosts = []string{}
+	}
+	m.Hosts = append(m.Hosts, d)
+}
+
+// ===== Append methods for AtappEtcd ===== Repeated =====
+func (m *AtappEtcd) AppendAndReverseHosts(l int, d string) {
+	if m.Hosts == nil {
+		m.Hosts = make([]string, 0, l)
 	}
 	m.Hosts = append(m.Hosts, d)
 }
@@ -7266,7 +7370,7 @@ func (m *AtappDiscovery) MutableListen() []string {
 }
 
 // ===== ReverseIfNil methods for AtappDiscovery ===== Repeated =====
-func (m *AtappDiscovery) ReverseIfNilListen(l int32) []string {
+func (m *AtappDiscovery) ReverseIfNilListen(l int) []string {
 	if m.Listen == nil {
 		m.Listen = make([]string, 0, l)
 	}
@@ -7277,6 +7381,14 @@ func (m *AtappDiscovery) ReverseIfNilListen(l int32) []string {
 func (m *AtappDiscovery) AppendListen(d string) {
 	if m.Listen == nil {
 		m.Listen = []string{}
+	}
+	m.Listen = append(m.Listen, d)
+}
+
+// ===== Append methods for AtappDiscovery ===== Repeated =====
+func (m *AtappDiscovery) AppendAndReverseListen(l int, d string) {
+	if m.Listen == nil {
+		m.Listen = make([]string, 0, l)
 	}
 	m.Listen = append(m.Listen, d)
 }
@@ -7317,7 +7429,7 @@ func (m *AtappDiscovery) MutableGateways() []*AtappGateway {
 }
 
 // ===== ReverseIfNil methods for AtappDiscovery ===== Repeated =====
-func (m *AtappDiscovery) ReverseIfNilGateways(l int32) []*AtappGateway {
+func (m *AtappDiscovery) ReverseIfNilGateways(l int) []*AtappGateway {
 	if m.Gateways == nil {
 		m.Gateways = make([]*AtappGateway, 0, l)
 	}
@@ -7328,6 +7440,14 @@ func (m *AtappDiscovery) ReverseIfNilGateways(l int32) []*AtappGateway {
 func (m *AtappDiscovery) AppendGateways(d *AtappGateway) {
 	if m.Gateways == nil {
 		m.Gateways = []*AtappGateway{}
+	}
+	m.Gateways = append(m.Gateways, d)
+}
+
+// ===== Append methods for AtappDiscovery ===== Repeated =====
+func (m *AtappDiscovery) AppendAndReverseGateways(l int, d *AtappGateway) {
+	if m.Gateways == nil {
+		m.Gateways = make([]*AtappGateway, 0, l)
 	}
 	m.Gateways = append(m.Gateways, d)
 }
