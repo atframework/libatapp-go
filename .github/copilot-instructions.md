@@ -46,6 +46,6 @@ Go 实现的 atapp 应用框架库，提供应用生命周期管理、模块系�
 
 ### 构建
 
-- 优先使用 `task`（`Taskfile.yml` 为准）。
-- 生成协议代码：`task generate-protocol`。
-- 运行测试：`go test ./...`。
+- 优先使用统一纯 Go 构建工具 `atbuild`（配置文件：`atbuild.yaml`、`tools.mod`、`mise.toml`）。
+- 生成协议代码：`go tool -modfile tools.mod atbuild proto`（或 `go generate ./...`）。
+- 运行测试：`go test ./...`（独立性校验：`GOWORK=off go test ./...`）。

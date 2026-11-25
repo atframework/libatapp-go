@@ -2,19 +2,20 @@
 
 ## Prerequisites
 
-- Go 1.25+
-- `protoc` (protobuf compiler)
-- `protoc-gen-go` (`go install google.golang.org/protobuf/cmd/protoc-gen-go@latest`)
-- `protoc-gen-mutable`（自定义插件，生成 `*_mutable.pb.go`）
-- [go-task](https://taskfile.dev/)（可选但推荐）
+- Go 1.27.4+（见 `mise.toml`）
+- `protoc`（`atbuild` 会在缺失时按 `atbuild.yaml` 版本自动下载缓存）
+- `protoc-gen-go`、`protoc-gen-mutable` 与 `atbuild`（在 `tools.mod` 中通过 Go `tool` 指令锁定版本）
 
 ## Proto 代码生成
 
 ```bash
-# 使用 Taskfile
-task generate-protocol
+# 使用统一 Go 构建工具（支持 SHA-256 增量缓存与跨仓 proto 路径解析）
+go tool -modfile tools.mod atbuild proto
 
-# 或直接调用
+# 或通过 go generate
+go generate ./...
+
+# 或直接调用 protoc
 cd protocol && protoc --go_out=. --mutable_out=. \
   --go_opt=paths=source_relative --mutable_opt=paths=source_relative \
   --proto_path=./ ./atframe/*.proto

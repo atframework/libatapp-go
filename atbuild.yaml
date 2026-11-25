@@ -1,0 +1,20 @@
+protoc_version: "32.1"
+cache_dir: ".cache/atbuild"
+tools_dir: ".cache/atbuild/tools"
+tools_modfile: "tools.mod"
+standalone_modules:
+  - "."
+  - "etcd_module_v2/integration"
+
+proto_targets:
+  - name: "libatapp-protocol"
+    stage: 0
+    work_dir: "protocol"
+    proto_paths:
+      - "."
+    files:
+      - "atframe/*.proto"
+    go_out: "."
+    mutable_out: "."
+    go_opt: "paths=source_relative"
+    mutable_opt: "paths=source_relative"

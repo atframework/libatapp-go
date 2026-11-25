@@ -1,6 +1,6 @@
 module github.com/atframework/libatapp-go/etcd_module_v2/integration
 
-go 1.25.1
+go 1.27.4
 
 require (
 	github.com/atframework/libatapp-go v0.0.0

@@ -1,6 +1,6 @@
 module github.com/atframework/libatapp-go
 
-go 1.25.1
+go 1.27.4
 
 require (
 	github.com/atframework/atframe-utils-go v1.0.5-0.20260416024202-66c04636f055
